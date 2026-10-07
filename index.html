@@ -147,6 +147,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
       <div><label for="sStr">Strength (0.5–1)</label><input id="sStr" type="number" step="0.05" min="0.3" max="1"></div>
       <div><label for="sPar">Parallel jobs</label><input id="sPar" type="number" min="1" max="4"></div>
       <div><label for="sDwell">Pause before painting (ms)</label><input id="sDwell" type="number" step="100" min="300"></div>
+      <div><label for="sJoin">Strokes within this many ms belong together</label><input id="sJoin" type="number" step="100" min="0"></div>
       <div><label for="sLeave">Move-away distance (px)</label><input id="sLeave" type="number" step="10" min="20"></div>
       <div><label for="sCtx">Context around sketch (0–1)</label><input id="sCtx" type="number" step="0.05" min="0" max="1"></div>
       <div><label for="sBrush">Pen size</label><input id="sBrush" type="number" step="0.5" min="1" max="20"></div>
@@ -182,7 +183,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b8 line-based joining';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b9 2 s join window';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -197,7 +198,7 @@ const DEFAULTS = {
   extra: 'fully painted, vivid saturated colors, rich detail, single subject on plain white paper',
   neighbours: 0.35,
   lang: '', llm: true, master: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
-  strength: 0.95, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
+  strength: 0.95, parallel: 2, dwell: 1800, joinWindow: 2000, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
 const SETTINGS_V = 5;
 const OLD_EXTRA = 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork';
@@ -353,6 +354,10 @@ function belongsTo(r, st, box){
 function addStroke(st){
   const box = strokeBox(st);
   const hits = regions.filter(r => belongsTo(r, st, box));
+  // everything drawn within the join window of the previous stroke belongs to the same sketch
+  const prev = strokeOrder[strokeOrder.length - 1];
+  const recent = prev && st.t0 - prev.t1 < S.joinWindow && regions.find(r => r.id === prev.regionId);
+  if (recent){ const i = hits.indexOf(recent); if (i > 0) hits.splice(i, 1); if (i !== 0) hits.unshift(recent); }
   let r;
   if (!hits.length){
     r = { id: nextId++, strokes: [], bbox: box, version: 0, lastTouched: 0, lastStroke: 0, status: 'waiting', prompt: '', err: '', abort: null, timer: null, chip: null };
@@ -386,7 +391,7 @@ function touch(r){
   queue = queue.filter(q => q !== r);
   setStatus(r, 'waiting');
   clearTimeout(r.timer);
-  r.timer = setTimeout(() => dwellDone(r), S.dwell);
+  r.timer = setTimeout(() => dwellDone(r), Math.max(S.dwell, S.joinWindow));
 }
 // if you are mid-sentence when the pen stops, wait (a little) for the sentence to end
 function dwellDone(r, held = 0){
@@ -407,7 +412,9 @@ function removeRegion(r, dropResults = true){
 
 // focus shift: pen lands or hovers away from a sketch that is still waiting
 function focusShift(p){
+  const now = performance.now();
   for (const r of regions){
+    if (now - r.lastStroke < S.joinWindow) continue;               // the next stroke may still join it
     if (r.status === 'waiting' && distToBox(p, r.bbox) > S.leave) enqueue(r);
   }
 }
@@ -977,7 +984,7 @@ $('btnExport').onclick = () => {
 
 // ---------- settings sheet ----------
 const FIELDS = [['sKey','key'],['sEngine','engine'],['sFillStr','fillStrength',Number],['sFillTone','fillTone'],['sCnM','cnModel'],['sCnScale','cnScale',Number],['sCnPS','cnPreviewSteps',Number],['sCnS','cnSteps',Number],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
-  ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
+  ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sJoin','joinWindow',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
   $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety;
