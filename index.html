@@ -173,6 +173,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     <textarea id="sMaster" rows="6"></textarea>
     <p class="note">Sent to the LLM with every sketch's words. Clear it to restore the default.</p>
     <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
+    <label class="check"><input id="sAdapt" type="checkbox"> Adapt fill, strength and improvement pass to the type of object (lettering, geometric, natural, group, creature)</label>
     <label class="check"><input id="sSafety" type="checkbox"> fal.ai safety filter (it sometimes blocks harmless sketches)</label>
     <label class="check"><input id="sPen" type="checkbox"> Only Apple Pencil draws (fingers tap)</label>
     <div class="row">
@@ -189,7 +190,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b13 noise fill';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b14 object types';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -203,7 +204,7 @@ const DEFAULTS = {
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
   extra: 'fully painted, vivid saturated colors, rich detail, single subject on plain white paper',
   neighbours: 0.35,
-  lang: '', llm: true, master: '', analysis: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
+  adapt: true, lang: '', llm: true, master: '', analysis: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, joinWindow: 2000, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
 const SETTINGS_V = 6;
@@ -225,6 +226,14 @@ function saveSettings(){
 }
 const S = loadSettings();
 document.getElementById('build').textContent = BUILD + ' \u00b7 ' + S.engine;
+// is the server already on a newer build than this page? (tells a stale browser cache from a missing deploy)
+fetch(location.href.split('#')[0], { cache: 'no-store' }).then(res => res.text()).then(html => {
+  const live = (html.match(/const BUILD = '([^']+)'/) || [])[1];
+  if (live && live !== BUILD){
+    document.getElementById('build').textContent += ' \u00b7 server has ' + live + ', reload';
+    setTimeout(() => toast('A newer version (' + live + ') is on the server. Reload the page.'), 500);
+  }
+}).catch(() => {});
 
 // ---------- DOM ----------
 const $ = id => document.getElementById(id);
@@ -525,7 +534,21 @@ const MASTER_DEFAULT = 'You write the prompt for an image model that paints one 
   'Never mention children, kids, babies or anyone\'s age, nor nudity or bodies; say "naive drawing style" instead of "children\'s drawing". ' +
   'Describe the finished painted object, not the drawing: never use the words sketch, drawing, pencil, outline or line art. ' +
   'Answer in English with exactly two lines. Line 1: the prompt only, at most 25 words, comma-separated, no quotes; if nothing is known: simple colorful object. ' +
-  'Line 2: the main colour of each thing as hex codes separated by spaces, one per object, at most 5, for example #d23a2a for a red apple, or #d23a2a #f2d24b #6b2d7a for an apple, a banana and grapes.';
+  'Line 2: the main colour of each thing as hex codes separated by spaces, one per object, at most 5, for example #d23a2a for a red apple, or #d23a2a #f2d24b #6b2d7a for an apple, a banana and grapes. ' +
+  'Line 3: TYPE: and one word for what kind of sketch it is: lettering (letters, words, numbers, logos; then spell the exact characters in line 1), ' +
+  'geometric (man-made, hard-edged things: boxes, cubes, buildings, furniture, vehicles, tools), organic (one natural thing: fruit, food, plant, rock), ' +
+  'group (several things drawn as one shape), creature (an animal or a figure), or other.';
+// how each kind of sketch is prepared, prompted and improved. base: fill under the lines (null = setting);
+// strength: first pass (null = setting); refine: strength of the improvement pass, which repaints the first result
+const PROFILES = {
+  lettering: { label: 'lettering', base: 'colour', strength: 0.75, refine: 0.35, add: 'three-dimensional letterforms, exact letter shapes, crisp clean edges' },
+  geometric: { label: 'geometric, man-made', base: 'colour', strength: 0.8, refine: 0.4, add: 'clean straight edges, flat planes, sharp corners, accurate perspective' },
+  organic:   { label: 'natural object', base: 'noise', strength: 0.88, refine: 0.45, add: 'natural form, realistic surface texture' },
+  group:     { label: 'group, still life', base: 'noise', strength: 0.92, refine: 0.45, add: 'several distinct items arranged together' },
+  creature:  { label: 'animal or figure', base: 'noise', strength: 0.88, refine: 0.4, add: 'coherent anatomy' },
+  other:     { label: 'other', base: null, strength: null, refine: 0.45, add: '' }
+};
+const profileOf = r => (S.adapt && PROFILES[r.type]) || PROFILES.other;
 const ANALYSIS_DEFAULT = 'You follow an artist who thinks aloud while drawing on a digital board, where an image model paints each sketch. ' +
   'Keep a short working brief of what the artist is making, from everything said so far: the overall picture or theme (for example a still life of mixed fruit on a table), ' +
   'the style and medium asked for, the objects already drawn or planned with their colours, and standing instructions (for example make everything brighter). ' +
@@ -646,7 +669,7 @@ async function describe(r, signal){
   if (r.llmKey !== key){
     try {
       const o = await speechToPrompt(said, brief, recent, signal);
-      r.llmKey = key; r.llmPrompt = o.prompt; r.colors = o.colors;
+      r.llmKey = key; r.llmPrompt = o.prompt; r.colors = o.colors; r.type = o.type;
     } catch (e){
       if (signal.aborted) throw e;
       if (!speech.llmWarned){ speech.llmWarned = true; toast('Speech-to-prompt failed, using your words as they are. ' + (e.message || e)); }
@@ -677,10 +700,11 @@ async function speechToPrompt(said, brief, recent, signal){
     'Said while drawing this sketch: "' + (said || '(nothing)') + '"\n' +
     'Most recent speech: "' + (recent || '(nothing)') + '"', signal, 6000);
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const out = lines.find(l => !/^(line \d:?\s*)?#[0-9a-f]{6}\b/i.test(l)) || '';
+  const out = lines.find(l => !/^(line \d:?\s*)?(#[0-9a-f]{6}\b|type\s*:)/i.test(l)) || '';
+  const type = ((text.match(/type\s*:\s*\**\s*([a-z]+)/i) || [])[1] || '').toLowerCase();
   if (!out) throw new Error('LLM returned no text.');
   const colors = lines.filter(l => l !== out).join(' ').match(/#[0-9a-f]{6}\b/gi) || [];
-  return { prompt: out.replace(/^line 1:\s*/i, '').replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300), colors: colors.slice(0, 5) };
+  return { prompt: out.replace(/^line 1:\s*/i, '').replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300), colors: colors.slice(0, 5), type: PROFILES[type] ? type : 'other' };
 }
 
 // the running brief: what you are making overall, rebuilt from new speech in the background
@@ -791,6 +815,9 @@ function snapshot(r){
   sx.restore();
   sx.globalAlpha = 1;                                         // after restore: the save above kept the faded alpha
   const shape = shapeOf(r, x, y, s, 256);
+  const base = document.createElement('canvas'); base.width = base.height = GEN;   // paper + faded neighbours, for the improvement pass
+  base.getContext('2d').drawImage(src, 0, 0);
+  const prof = profileOf(r), fillBase = prof.base || S.fillBase;
   if (S.engine === 'fill'){                                   // a solid shape to paint, not an empty outline
     const t = document.createElement('canvas'); t.width = t.height = 256;
     const tx = t.getContext('2d');
@@ -799,7 +826,7 @@ function snapshot(r){
     const bx0 = (b.x0 - x) * k, by0 = (b.y0 - y) * k, bx1 = (b.x1 - x) * k, by1 = (b.y1 - y) * k;
     const paint = document.createElement('canvas'); paint.width = paint.height = 256;
     const px = paint.getContext('2d');
-    if (S.fillBase === 'noise'){                              // coloured noise: a surface without favouring any colour
+    if (fillBase === 'noise'){                                // coloured noise: a surface without favouring any colour
       paintNoise(px);
     } else if (cols.length > 1){                               // a group (still life): soft patches of each colour
       px.fillStyle = cols[0]; px.fillRect(0, 0, 256, 256);
@@ -812,20 +839,24 @@ function snapshot(r){
       blur.getContext('2d').drawImage(paint, 0, 0, 24, 24);
       px.imageSmoothingEnabled = true; px.imageSmoothingQuality = 'high'; px.drawImage(blur, 0, 0, 256, 256);
     }
-    const textured = S.fillBase === 'noise' || cols.length > 1;
-    const base = textured ? '#808080' : cols[0];              // shaded like a lit object: light top-left, dark bottom-right
+    const textured = fillBase === 'noise' || cols.length > 1;
+    const tone = textured ? '#808080' : cols[0];              // shaded like a lit object: light top-left, dark bottom-right
     const g = px.createLinearGradient(bx0, by0, bx1, by1);
-    g.addColorStop(0, mix(base, '#ffffff', 0.35)); g.addColorStop(0.5, base); g.addColorStop(1, mix(base, '#000000', 0.3));
+    g.addColorStop(0, mix(tone, '#ffffff', 0.35)); g.addColorStop(0.5, tone); g.addColorStop(1, mix(tone, '#000000', 0.3));
     if (textured){ px.globalAlpha = 0.35; px.globalCompositeOperation = 'overlay'; }
     px.fillStyle = g; px.fillRect(0, 0, 256, 256);
     tx.globalCompositeOperation = 'source-in'; tx.drawImage(paint, 0, 0);
     sx.imageSmoothingEnabled = true; sx.imageSmoothingQuality = 'high';
     sx.drawImage(t, 0, 0, GEN, GEN);
   }
-  sx.save(); sx.scale(GEN / s, GEN / s); sx.translate(-x, -y);
-  for (const st of r.strokes) drawStroke(sx, st, '#111');
-  sx.restore();
+  const strokesOn = (ctx, alpha) => {
+    ctx.save(); ctx.globalAlpha = alpha; ctx.scale(GEN / s, GEN / s); ctx.translate(-x, -y);
+    for (const st of r.strokes) drawStroke(ctx, st, '#111');
+    ctx.restore();
+  };
+  strokesOn(sx, 1);
   const url = src.toDataURL('image/jpeg', 0.9);
+  const strength = S.engine === 'fill' ? (prof.strength || S.fillStrength) : S.strength;
 
   // blend mask: only the sketch's shape (inside its outline, plus the strokes) goes onto the board,
   // with a soft edge, so the painting keeps the shape you drew whatever the model does around it
@@ -849,7 +880,20 @@ function snapshot(r){
   cx2.save(); cx2.scale(GEN / s, GEN / s); cx2.translate(-x, -y);
   for (const st of r.strokes) drawStroke(cx2, st, '#fff');
   cx2.restore();
-  return { x, y, s, url, control: ctl.toDataURL('image/png'), mask: m };
+  // improvement pass: the first result inside the shape, on the same paper, with the lines faintly on top
+  const improve = bmp => {
+    const c = document.createElement('canvas'); c.width = c.height = GEN;
+    const cx = c.getContext('2d');
+    cx.drawImage(base, 0, 0);
+    const t = document.createElement('canvas'); t.width = t.height = GEN;
+    const tx = t.getContext('2d');
+    tx.imageSmoothingEnabled = true; tx.drawImage(shape, 0, 0, GEN, GEN);
+    tx.globalCompositeOperation = 'source-in'; tx.drawImage(bmp, 0, 0, GEN, GEN);
+    cx.drawImage(t, 0, 0);
+    strokesOn(cx, 0.45);
+    return c.toDataURL('image/jpeg', 0.9);
+  };
+  return { x, y, s, url, strength, improve, control: ctl.toDataURL('image/png'), mask: m };
 }
 
 // cheap blur: downscale then upscale with smoothing
@@ -892,7 +936,7 @@ async function generate(model, steps, snap, prompt, seed, signal){
     ? { prompt, control_image_url: snap.control, controlnet_conditioning_scale: Number(S.cnScale), image_size: 'square_hd',
         negative_prompt: 'blurry, lowres, extra objects, scenery, busy background, frame, text, watermark',
         seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter }
-    : { prompt, image_url: snap.url, strength: Number(S.engine === 'fill' ? S.fillStrength : S.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter };
+    : { prompt, image_url: snap.url, strength: Number(snap.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter };
   if (String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
   const res = await safeFetch('https://fal.run/' + model.trim(), {
     method: 'POST', signal,
@@ -964,7 +1008,8 @@ async function runJob(r){
   const t0 = performance.now();
   try {
     setStatus(r, 'preview');
-    prompt = buildPrompt(await describe(r, ac.signal));
+    const subject = await describe(r, ac.signal);
+    prompt = buildPrompt([subject, profileOf(r).add].filter(Boolean).join(', '));
     r.lastPrompt = prompt;
     if (r.version !== version || !regions.includes(r)) return;
     snap = snapshot(r);                                          // after describe: the fill uses the colour it found
@@ -978,7 +1023,9 @@ async function runJob(r){
       setStatus(r, 'refining');
       let b = null;
       const rf = job('refine');
-      try { b = await generate(rf.model, rf.steps, snap, prompt, a.seed, ac.signal); }
+      // fill engine: improve the first result (repaint it lightly) rather than start again from the sketch
+      const input = S.engine === 'fill' ? Object.assign({}, snap, { url: snap.improve(a.bmp), strength: profileOf(r).refine }) : snap;
+      try { b = await generate(rf.model, rf.steps, input, prompt, a.seed, ac.signal); }
       catch (e){ if (e.name !== 'BlockedError') throw e; }            // blocked refine: keep the preview
       if (r.version !== version || !regions.includes(r)) return;
       if (b) applyResult(r, b, snap, slot);
@@ -1007,6 +1054,7 @@ function openRegion(r){
   const heard = heardFor(r);
   if (heard) info.push('Heard: “' + heard + '”.');
   if (speech.brief) info.push('Brief: ' + speech.brief);
+  if (r.type) info.push('Type: ' + profileOf(r).label + (S.adapt ? '' : ' (adapting is off)') + '.');
   if (r.lastPrompt) info.push('Prompt: ' + r.lastPrompt + (r.colors && r.colors.length ? ' (colours ' + r.colors.join(' ') + ')' : '') + '.');
   if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
   $('rsInfo').textContent = info.join(' ');
@@ -1071,7 +1119,7 @@ const FIELDS = [['sKey','key'],['sEngine','engine'],['sFillStr','fillStrength',N
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sJoin','joinWindow',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
-  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety;
+  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety; $('sAdapt').checked = !!S.adapt;
   $('sMaster').value = S.master.trim() || MASTER_DEFAULT;
   $('sAnalysis').value = S.analysis.trim() || ANALYSIS_DEFAULT;
   $('settingsSheet').classList.add('open');
@@ -1080,7 +1128,7 @@ $('btnSettings').onclick = openSettings;
 $('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
 $('sSave').onclick = () => {
   for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
-  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked; S.safety = $('sSafety').checked;
+  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked; S.safety = $('sSafety').checked; S.adapt = $('sAdapt').checked;
   const analysis = $('sAnalysis').value.trim();
   S.analysis = analysis === ANALYSIS_DEFAULT ? '' : analysis;
   const master = $('sMaster').value.trim();

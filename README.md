@@ -19,3 +19,17 @@ Tap **Listen** and talk about what you draw. The browser's speech recognition (S
 - When a sketch is painted, a second LLM step reads the brief plus what you said while drawing it and writes a visual description of just that sketch, plus one colour per object. A sketch may be a group (a still life of several fruits); its fill then starts from patches of those colours. You can speak any language; if the LLM fails, your words are used as they are.
 - Both instructions (analysis prompt and master prompt) are editable in Settings.
 - A sketch's typed "What is it?" text overrides speech. Tap a sketch's chip to see what was heard and the prompt that was used.
+
+## Object types
+
+The prompt LLM also names what kind of sketch it is, and each kind is prepared and improved differently (Settings: "Adapt … to the type of object"):
+
+| Type | Fill under the lines | First pass strength | Improvement pass | Added to the prompt |
+|---|---|---|---|---|
+| lettering | colour | 0.75 | 0.35 | exact letter shapes, crisp edges |
+| geometric (man-made) | colour | 0.8 | 0.4 | straight edges, sharp corners, perspective |
+| organic (one natural thing) | noise | 0.88 | 0.45 | natural form, surface texture |
+| group (still life) | noise | 0.92 | 0.45 | several distinct items |
+| creature | noise | 0.88 | 0.4 | coherent anatomy |
+
+The improvement pass repaints the first result lightly (inside the shape, lines faintly on top) instead of starting again from the sketch.
