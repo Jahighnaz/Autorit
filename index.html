@@ -183,7 +183,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b9 2 s join window';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b10 filter-off fix';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -833,7 +833,8 @@ async function generate(model, steps, snap, prompt, seed, signal){
   const blob = await (await safeFetch(out, { signal })).blob();
   const bmp = await createImageBitmap(blob);
   // fal's safety checker answers a flagged image with a plain black one instead of an error
-  if (j.has_nsfw_concepts && j.has_nsfw_concepts[0]) throw blockedError('fal.ai\'s safety filter flagged this painting');
+  // fal reports the flag even with the filter off; only then is the image actually withheld
+  if (input.enable_safety_checker && j.has_nsfw_concepts && j.has_nsfw_concepts[0]) throw blockedError('fal.ai\'s safety filter flagged this painting');
   if (isBlank(bmp)) throw blockedError('the painting came back all black (usually the safety filter)');
   return bmp;
 }
@@ -929,7 +930,9 @@ function openRegion(r){
   if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
   $('rsInfo').textContent = info.join(' ');
   $('rsRevert').disabled = !hasResult(r.id);
-  $('rsNoFilter').hidden = !(r.status === 'error' && /^Blocked/.test(r.err) && S.safety);
+  $('rsNoFilter').hidden = !(r.status === 'error' && /^Blocked/.test(r.err) && S.safety && !r.noFilter);
+  if (r.status === 'error' && /^Blocked/.test(r.err) && !S.safety) $('rsPaint').textContent = 'Paint again (filter is off now)';
+  else $('rsPaint').textContent = 'Paint again';
   $('regionSheet').classList.add('open');
 }
 function closeRegion(){ if (openR) openR.prompt = $('rsPrompt').value; $('regionSheet').classList.remove('open'); openR = null; }
