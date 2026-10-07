@@ -126,6 +126,9 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
       <div><label for="sCtx">Context around sketch (0–1)</label><input id="sCtx" type="number" step="0.05" min="0" max="1"></div>
       <div><label for="sBrush">Pen size</label><input id="sBrush" type="number" step="0.5" min="1" max="20"></div>
     </div>
+    <label for="sExtra">Always add to the prompt</label>
+    <input id="sExtra" type="text">
+    <p class="note">Pushes the model to paint the whole picture in colour rather than return the pencil lines. Clear it to turn this off.</p>
     <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
     <label class="check"><input id="sPen" type="checkbox"> Only Apple Pencil draws (fingers tap)</label>
     <div class="row">
@@ -151,11 +154,17 @@ const DEFAULTS = {
   previewModel: 'fal-ai/fast-lightning-sdxl/image-to-image', previewSteps: '2',
   refine: true,
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
-  strength: 0.9, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
+  extra: 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork',
+  strength: 0.95, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
+const SETTINGS_V = 2;
 function loadSettings(){
-  try { return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem('sketchboard.settings') || '{}')); }
-  catch { return Object.assign({}, DEFAULTS); }
+  try {
+    const saved = JSON.parse(localStorage.getItem('sketchboard.settings') || '{}');
+    if ((saved.v || 1) < 2 && saved.strength === 0.9) delete saved.strength;   // old default was too weak to paint
+    return Object.assign({}, DEFAULTS, saved, { v: SETTINGS_V });
+  }
+  catch { return Object.assign({}, DEFAULTS, { v: SETTINGS_V }); }
 }
 function saveSettings(){
   try { localStorage.setItem('sketchboard.settings', JSON.stringify(S)); } catch {}
@@ -408,8 +417,8 @@ function pump(){
 }
 
 function buildPrompt(r){
-  const parts = [r.prompt.trim(), S.style.trim()].filter(Boolean);
-  return parts.length ? parts.join(', ') : 'detailed colorful illustration, clean composition';
+  const subject = r.prompt.trim() || 'colorful illustration, clean composition';
+  return [subject, S.style.trim(), String(S.extra || '').trim()].filter(Boolean).join(', ');
 }
 
 function snapshot(r){
@@ -638,7 +647,7 @@ $('btnExport').onclick = () => {
 };
 
 // ---------- settings sheet ----------
-const FIELDS = [['sKey','key'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
+const FIELDS = [['sKey','key'],['sExtra','extra'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
