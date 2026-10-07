@@ -108,6 +108,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     <div class="row">
       <button id="rsPaint" class="primary">Paint again</button>
       <button id="rsRevert">Revert last painting</button>
+      <button id="rsNoFilter" hidden>Paint without filter</button>
       <button id="rsDelete">Delete sketch</button>
       <button id="rsClose">Close</button>
     </div>
@@ -709,8 +710,8 @@ async function generate(model, steps, snap, prompt, seed, signal){
   const input = control
     ? { prompt, control_image_url: snap.control, controlnet_conditioning_scale: Number(S.cnScale), image_size: 'square_hd',
         negative_prompt: 'blurry, lowres, extra objects, scenery, busy background, frame, text, watermark',
-        seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety }
-    : { prompt, image_url: snap.url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety };
+        seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter }
+    : { prompt, image_url: snap.url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter };
   if (String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
   const res = await safeFetch('https://fal.run/' + model.trim(), {
     method: 'POST', signal,
@@ -731,11 +732,12 @@ async function generate(model, steps, snap, prompt, seed, signal){
   const blob = await (await safeFetch(out, { signal })).blob();
   const bmp = await createImageBitmap(blob);
   // fal's safety checker answers a flagged image with a plain black one instead of an error
-  if ((j.has_nsfw_concepts && j.has_nsfw_concepts[0]) || isBlank(bmp)) throw blockedError();
+  if (j.has_nsfw_concepts && j.has_nsfw_concepts[0]) throw blockedError('fal.ai\'s safety filter flagged this painting');
+  if (isBlank(bmp)) throw blockedError('the painting came back all black (usually the safety filter)');
   return bmp;
 }
-function blockedError(){
-  const e = new Error('The model\'s safety filter blocked this painting. Tap to paint again, describe the sketch, or turn the filter off in Settings.');
+function blockedError(why){
+  const e = new Error('Blocked: ' + why + '. Harmless round shapes trip it often. Tap \u201cPaint without filter\u201d, or turn the filter off in Settings.');
   e.name = 'BlockedError'; return e;
 }
 function isBlank(bmp){
@@ -748,7 +750,7 @@ function isBlank(bmp){
   return max < 12;
 }
 // a flagged result is usually a false positive on a rough sketch: try a few other seeds
-async function generateSafe(model, steps, snap, prompt, seed, signal, tries = 3){
+async function generateSafe(model, steps, snap, prompt, seed, signal, tries = 4){
   for (let i = 0; ; i++){
     try { return { bmp: await generate(model, steps, snap, prompt, seed, signal), seed }; }
     catch (e){
@@ -775,6 +777,7 @@ async function runJob(r){
   if (r.abort) r.abort.abort();
   const ac = new AbortController(); r.abort = ac;
   const snap = snapshot(r);
+  snap.noFilter = !!r.noFilter;
   let prompt = '';
   const seed = Math.floor(Math.random() * 2147483647);
   const slot = {};
@@ -825,6 +828,7 @@ function openRegion(r){
   if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
   $('rsInfo').textContent = info.join(' ');
   $('rsRevert').disabled = !hasResult(r.id);
+  $('rsNoFilter').hidden = !(r.status === 'error' && /^Blocked/.test(r.err) && S.safety);
   $('regionSheet').classList.add('open');
 }
 function closeRegion(){ if (openR) openR.prompt = $('rsPrompt').value; $('regionSheet').classList.remove('open'); openR = null; }
@@ -836,6 +840,7 @@ $('rsRevert').onclick = () => {
   if (r.abort) r.abort.abort();
   composeGen(); setStatus(r, hasResult(r.id) ? 'done' : 'waiting'); closeRegion();
 };
+$('rsNoFilter').onclick = () => { const r = openR; closeRegion(); if (r){ r.noFilter = true; r.version++; r.lastTouched = performance.now(); enqueue(r); } };
 $('rsDelete').onclick = () => {
   const r = openR; if (!r) return;
   strokeOrder = strokeOrder.filter(s => s.regionId !== r.id);
