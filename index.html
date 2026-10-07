@@ -148,6 +148,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     <textarea id="sMaster" rows="6"></textarea>
     <p class="note">Sent to the LLM with every sketch's words. Clear it to restore the default.</p>
     <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
+    <label class="check"><input id="sSafety" type="checkbox"> fal.ai safety filter (it sometimes blocks harmless sketches)</label>
     <label class="check"><input id="sPen" type="checkbox"> Only Apple Pencil draws (fingers tap)</label>
     <div class="row">
       <button id="sSave" class="primary">Save settings</button>
@@ -174,7 +175,7 @@ const DEFAULTS = {
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
   extra: 'fully painted, vivid saturated colors, rich detail, single subject on plain white paper',
   neighbours: 0.35,
-  lang: '', llm: true, master: '', llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
+  lang: '', llm: true, master: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
 const SETTINGS_V = 3;
@@ -460,6 +461,7 @@ const MASTER_DEFAULT = 'You write the prompt for an image model that paints ONE 
   'From what was said while drawing this sketch, name the single thing it shows and its look (colour, material, pose). ' +
   'From what was said about the whole picture, take only style, palette, lighting and mood, never extra objects. ' +
   'The speech can be in any language, rambling and full of filler; ignore anything not about the picture. ' +
+  'Never mention children, kids, babies or anyone\'s age, nor nudity or bodies; say "naive drawing style" instead of "children\'s drawing". ' +
   'Answer in English with the prompt only: at most 20 words, comma-separated, no quotes. If nothing describable was said, answer: simple colorful drawing';
 
 function startListening(){
@@ -549,7 +551,7 @@ function showCaption(){
 // what to paint: typed text wins, then what was said (cleaned up by the LLM), else nothing
 async function describe(r, signal){
   r.heard = heardFor(r);
-  if (r.prompt.trim()) return r.prompt.trim();
+  if (/[\p{L}\p{N}]/u.test(r.prompt)) return r.prompt.trim();      // a stray "." does not override speech
   const scene = sceneText();
   if (!S.llm) return r.heard;
   if (!r.heard && !scene) return '';
@@ -664,7 +666,7 @@ async function safeFetch(url, opts){
 
 async function generate(model, steps, url, prompt, seed, signal){
   if (!S.key) throw new Error('Add your fal.ai key in Settings.');
-  const input = { prompt, image_url: url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true };
+  const input = { prompt, image_url: url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety };
   if (String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
   const res = await safeFetch('https://fal.run/' + model.trim(), {
     method: 'POST', signal,
@@ -685,7 +687,7 @@ async function generate(model, steps, url, prompt, seed, signal){
   return bmp;
 }
 function blockedError(){
-  const e = new Error('The model\'s safety filter blocked this painting. Tap to paint again, or describe the sketch.');
+  const e = new Error('The model\'s safety filter blocked this painting. Tap to paint again, describe the sketch, or turn the filter off in Settings.');
   e.name = 'BlockedError'; return e;
 }
 function isBlank(bmp){
@@ -829,7 +831,7 @@ const FIELDS = [['sKey','key'],['sExtra','extra'],['sLang','lang'],['sLlmEp','ll
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
-  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm;
+  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety;
   $('sMaster').value = S.master.trim() || MASTER_DEFAULT;
   $('settingsSheet').classList.add('open');
 }
@@ -837,7 +839,7 @@ $('btnSettings').onclick = openSettings;
 $('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
 $('sSave').onclick = () => {
   for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
-  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked;
+  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked; S.safety = $('sSafety').checked;
   const master = $('sMaster').value.trim();
   S.master = master === MASTER_DEFAULT ? '' : master;
   if (speech.on){ stopListening(); startListening(); }                    // pick up a new language
