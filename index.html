@@ -28,6 +28,7 @@ body{
   overscroll-behavior:none;
 }
 header{display:flex;gap:6px;align-items:center;padding:8px 12px;flex-wrap:wrap}
+header h1 small{font-size:11px;font-weight:400;color:var(--muted)}
 header h1{font-size:17px;font-weight:650;letter-spacing:-.01em;margin:0 8px 0 2px}
 #style{flex:1 1 220px;min-width:160px}
 input[type=text],input[type=password],input[type=number],select,textarea{
@@ -80,7 +81,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 </head>
 <body>
 <header>
-  <h1>Sketchboard</h1>
+  <h1>Sketchboard <small id="build"></small></h1>
   <input id="style" type="text" placeholder="Style for the whole board, e.g. watercolor, warm evening light" aria-label="Board style">
   <button id="btnMic" aria-pressed="false" title="Listen while you draw; what you say steers the painting">Listen</button>
   <button id="btnGen" class="primary" title="Paint every unfinished sketch now">Paint now</button>
@@ -181,6 +182,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
+const BUILD = 'b6 fill shapes';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close join an existing sketch
@@ -212,6 +214,7 @@ function saveSettings(){
   try { localStorage.setItem('sketchboard.settings', JSON.stringify(S)); } catch {}
 }
 const S = loadSettings();
+document.getElementById('build').textContent = BUILD + ' \u00b7 ' + S.engine;
 
 // ---------- DOM ----------
 const $ = id => document.getElementById(id);
