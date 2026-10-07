@@ -499,7 +499,33 @@ async function generate(model, steps, url, prompt, seed, signal){
   const out = j.images && j.images[0] && j.images[0].url;
   if (!out) throw new Error('fal.ai returned no image.');
   const blob = await (await safeFetch(out, { signal })).blob();
-  return await createImageBitmap(blob);
+  const bmp = await createImageBitmap(blob);
+  // fal's safety checker answers a flagged image with a plain black one instead of an error
+  if ((j.has_nsfw_concepts && j.has_nsfw_concepts[0]) || isBlank(bmp)) throw blockedError();
+  return bmp;
+}
+function blockedError(){
+  const e = new Error('The model\'s safety filter blocked this painting. Tap to paint again, or describe the sketch.');
+  e.name = 'BlockedError'; return e;
+}
+function isBlank(bmp){
+  const c = document.createElement('canvas'); c.width = c.height = 16;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(bmp, 0, 0, 16, 16);
+  const d = x.getImageData(0, 0, 16, 16).data;
+  let max = 0;
+  for (let i = 0; i < d.length; i += 4) max = Math.max(max, d[i], d[i+1], d[i+2]);
+  return max < 12;
+}
+// a flagged result is usually a false positive on a rough sketch: try a few other seeds
+async function generateSafe(model, steps, url, prompt, seed, signal, tries = 3){
+  for (let i = 0; ; i++){
+    try { return { bmp: await generate(model, steps, url, prompt, seed, signal), seed }; }
+    catch (e){
+      if (e.name !== 'BlockedError' || i >= tries - 1) throw e;
+      seed = Math.floor(Math.random() * 2147483647);
+    }
+  }
 }
 
 function applyResult(r, bmp, snap, slot){
@@ -525,15 +551,17 @@ async function runJob(r){
   const t0 = performance.now();
   try {
     setStatus(r, 'preview');
-    const a = await generate(S.previewModel, S.previewSteps, snap.url, prompt, seed, ac.signal);
+    const a = await generateSafe(S.previewModel, S.previewSteps, snap.url, prompt, seed, ac.signal);
     if (r.version !== version || !regions.includes(r)) return;     // sketch changed meanwhile: drop stale result
-    applyResult(r, a, snap, slot);
+    applyResult(r, a.bmp, snap, slot);
     r.timing = Math.round(performance.now() - t0);
     if (S.refine){
       setStatus(r, 'refining');
-      const b = await generate(S.refineModel, S.refineSteps, snap.url, prompt, seed, ac.signal);
+      let b = null;
+      try { b = await generate(S.refineModel, S.refineSteps, snap.url, prompt, a.seed, ac.signal); }
+      catch (e){ if (e.name !== 'BlockedError') throw e; }            // blocked refine: keep the preview
       if (r.version !== version || !regions.includes(r)) return;
-      applyResult(r, b, snap, slot);
+      if (b) applyResult(r, b, snap, slot);
     }
     r.timingTotal = Math.round(performance.now() - t0);
     setStatus(r, 'done');
