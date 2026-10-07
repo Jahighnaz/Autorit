@@ -182,14 +182,14 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b6 fill shapes';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b7 colour fill';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close join an existing sketch
 
 const DEFAULTS = {
   key: '', style: '',
-  engine: 'fill', fillStrength: 0.8, fillTone: '#c9bdac', cnModel: 'fal-ai/fast-sdxl-controlnet-canny', cnPreviewSteps: 12, cnSteps: 25, cnScale: 0.8,
+  engine: 'fill', fillStrength: 0.85, fillTone: '#c9bdac', cnModel: 'fal-ai/fast-sdxl-controlnet-canny', cnPreviewSteps: 12, cnSteps: 25, cnScale: 0.8,
   previewModel: 'fal-ai/fast-lightning-sdxl/image-to-image', previewSteps: '2',
   refine: true,
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
@@ -198,7 +198,7 @@ const DEFAULTS = {
   lang: '', llm: true, master: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
-const SETTINGS_V = 4;
+const SETTINGS_V = 5;
 const OLD_EXTRA = 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork';
 function loadSettings(){
   try {
@@ -206,6 +206,7 @@ function loadSettings(){
     if ((saved.v || 1) < 2 && saved.strength === 0.9) delete saved.strength;   // old default was too weak to paint
     if ((saved.v || 1) < 3 && saved.extra === OLD_EXTRA) delete saved.extra;   // old default invited whole scenes
     if ((saved.v || 1) < 4 && saved.engine === 'controlnet') delete saved.engine;  // was only ever the default
+    if ((saved.v || 1) < 5 && saved.fillStrength === 0.8) delete saved.fillStrength;
     return Object.assign({}, DEFAULTS, saved, { v: SETTINGS_V });
   }
   catch { return Object.assign({}, DEFAULTS, { v: SETTINGS_V }); }
@@ -485,7 +486,8 @@ const MASTER_DEFAULT = 'You write the prompt for an image model that paints ONE 
   'From what was said about the whole picture, take only style, palette, lighting and mood, never extra objects. ' +
   'The speech can be in any language, rambling and full of filler; ignore anything not about the picture. ' +
   'Never mention children, kids, babies or anyone\'s age, nor nudity or bodies; say "naive drawing style" instead of "children\'s drawing". ' +
-  'Answer in English with the prompt only: at most 20 words, comma-separated, no quotes. If nothing describable was said, answer: simple colorful drawing';
+  'Answer in English with exactly two lines. Line 1: the prompt only, at most 20 words, comma-separated, no quotes; if nothing describable was said: simple colorful drawing. ' +
+  'Line 2: the main colour of that thing as a hex code, for example #d23a2a for a red apple or #f2d24b for a banana.';
 
 function startListening(){
   if (!SR){ toast('Speech recognition is not available in this browser. Use Safari or Chrome.'); return; }
@@ -585,22 +587,27 @@ function showCaption(){
 }
 
 // what to paint: typed text wins, then what was said (cleaned up by the LLM), else nothing
+// typed text wins over speech; either way the LLM (if on) also names the thing's main colour,
+// which becomes the fill the model starts from
 async function describe(r, signal){
   r.heard = heardFor(r);
-  if (/[\p{L}\p{N}]/u.test(r.prompt)) return r.prompt.trim();      // a stray "." does not override speech
+  const typed = /[\p{L}\p{N}]/u.test(r.prompt) ? r.prompt.trim() : '';   // a stray "." does not override speech
+  const said = typed || r.heard;
   const scene = sceneText();
-  if (!S.llm) return r.heard;
-  if (!r.heard && !scene) return '';
-  const key = r.heard + '|' + scene + '|' + S.master;
-  if (r.llmKey === key) return r.llmPrompt;
-  try {
-    const p = await speechToPrompt(r.heard, scene, signal);
-    r.llmKey = key; r.llmPrompt = p; return p;
-  } catch (e){
-    if (signal.aborted) throw e;
-    if (!speech.llmWarned){ speech.llmWarned = true; toast('Speech-to-prompt failed, using your words as they are. ' + (e.message || e)); }
-    return r.heard;
+  if (!S.llm) return said;
+  if (!said && !scene) return '';
+  const key = said + '|' + scene + '|' + S.master;
+  if (r.llmKey !== key){
+    try {
+      const o = await speechToPrompt(said, scene, signal);
+      r.llmKey = key; r.llmPrompt = o.prompt; r.color = o.color;
+    } catch (e){
+      if (signal.aborted) throw e;
+      if (!speech.llmWarned){ speech.llmWarned = true; toast('Speech-to-prompt failed, using your words as they are. ' + (e.message || e)); }
+      return said;
+    }
   }
+  return r.llmPrompt || said;
 }
 async function speechToPrompt(heard, scene, signal){
   const ac = new AbortController();
@@ -616,9 +623,11 @@ async function speechToPrompt(heard, scene, signal){
     });
     if (!res.ok){ let t = ''; try { t = await res.text(); } catch {} throw new Error('LLM ' + res.status + ': ' + t.slice(0, 200)); }
     const j = await res.json();
-    const out = String(j.output || '').split('\n').map(l => l.trim()).find(Boolean) || '';
+    const text = String(j.output || '');
+    const out = text.split('\n').map(l => l.trim()).find(l => l && !/^(line \d:?\s*)?#[0-9a-f]{6}\b/i.test(l)) || '';
     if (!out) throw new Error('LLM returned no text.');
-    return out.replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300);
+    const hex = text.match(/#[0-9a-f]{6}\b/i);
+    return { prompt: out.replace(/^line 1:\s*/i, '').replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300), color: hex ? hex[0] : '' };
   } finally { clearTimeout(timer); signal.removeEventListener('abort', stop); }
 }
 
@@ -664,6 +673,12 @@ function shapeOf(r, x, y, s, n){
   return c;
 }
 
+function mix(a, b, t){
+  const p = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const ca = /^#[0-9a-f]{6}$/i.test(a) ? p(a) : [201, 189, 172], cb = p(b);
+  return '#' + ca.map((v, i) => Math.round(v + (cb[i] - v) * t).toString(16).padStart(2, '0')).join('');
+}
+
 function snapshot(r){
   const b = r.bbox;
   const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
@@ -683,14 +698,18 @@ function snapshot(r){
   sx.drawImage(others, x, y, s, s, 0, 0, GEN, GEN);
   sx.save(); sx.scale(GEN / s, GEN / s); sx.translate(-x, -y);
   for (const o of regions) if (o !== r && !hasResult(o.id)) for (const st of o.strokes) drawStroke(sx, st, '#111');
-  sx.globalAlpha = 1;
   sx.restore();
+  sx.globalAlpha = 1;                                         // after restore: the save above kept the faded alpha
   const shape = shapeOf(r, x, y, s, 256);
   if (S.engine === 'fill'){                                   // a solid shape to paint, not an empty outline
     const t = document.createElement('canvas'); t.width = t.height = 256;
     const tx = t.getContext('2d');
     tx.drawImage(shape, 0, 0);
-    tx.globalCompositeOperation = 'source-in'; tx.fillStyle = S.fillTone; tx.fillRect(0, 0, 256, 256);
+    const base = r.color || S.fillTone, k = 256 / s;               // shaded like a lit object: light top-left, dark bottom-right
+    const bx0 = (b.x0 - x) * k, by0 = (b.y0 - y) * k, bx1 = (b.x1 - x) * k, by1 = (b.y1 - y) * k;
+    const g = tx.createLinearGradient(bx0, by0, bx1, by1);
+    g.addColorStop(0, mix(base, '#ffffff', 0.35)); g.addColorStop(0.5, base); g.addColorStop(1, mix(base, '#000000', 0.3));
+    tx.globalCompositeOperation = 'source-in'; tx.fillStyle = g; tx.fillRect(0, 0, 256, 256);
     sx.imageSmoothingEnabled = true; sx.imageSmoothingQuality = 'high';
     sx.drawImage(t, 0, 0, GEN, GEN);
   }
@@ -829,9 +848,7 @@ async function runJob(r){
   const version = r.version;
   if (r.abort) r.abort.abort();
   const ac = new AbortController(); r.abort = ac;
-  const snap = snapshot(r);
-  snap.noFilter = !!r.noFilter;
-  let prompt = '';
+  let snap = null, prompt = '';
   const seed = Math.floor(Math.random() * 2147483647);
   const slot = {};
   const t0 = performance.now();
@@ -840,6 +857,8 @@ async function runJob(r){
     prompt = buildPrompt(await describe(r, ac.signal));
     r.lastPrompt = prompt;
     if (r.version !== version || !regions.includes(r)) return;
+    snap = snapshot(r);                                          // after describe: the fill uses the colour it found
+    snap.noFilter = !!r.noFilter;
     const pv = job('preview');
     const a = await generateSafe(pv.model, pv.steps, snap, prompt, seed, ac.signal);
     if (r.version !== version || !regions.includes(r)) return;     // sketch changed meanwhile: drop stale result
@@ -877,7 +896,7 @@ function openRegion(r){
   if (r.status === 'error') info.push(r.err);
   const heard = heardFor(r);
   if (heard) info.push('Heard: “' + heard + '”.');
-  if (r.lastPrompt) info.push('Prompt: ' + r.lastPrompt + '.');
+  if (r.lastPrompt) info.push('Prompt: ' + r.lastPrompt + (r.color ? ' (colour ' + r.color + ')' : '') + '.');
   if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
   $('rsInfo').textContent = info.join(' ');
   $('rsRevert').disabled = !hasResult(r.id);
