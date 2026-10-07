@@ -121,6 +121,17 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     <label for="sKey">fal.ai API key</label>
     <input id="sKey" type="password" placeholder="key-id:key-secret" autocomplete="off">
     <p class="note">Stored only in this browser. Anyone with access to this page in your browser can read it, so keep the page private.</p>
+    <label for="sEngine">Engine</label>
+    <select id="sEngine">
+      <option value="controlnet">ControlNet: follows your lines (sketch as edge map)</option>
+      <option value="img2img">Image-to-image: fastest, interprets more freely</option>
+    </select>
+    <div class="grid">
+      <div><label for="sCnM">ControlNet model</label><input id="sCnM" type="text"></div>
+      <div><label for="sCnScale">Line strictness (0–1.5)</label><input id="sCnScale" type="number" step="0.05" min="0" max="1.5"></div>
+      <div><label for="sCnPS">ControlNet preview steps</label><input id="sCnPS" type="number" min="1" max="50"></div>
+      <div><label for="sCnS">ControlNet refine steps</label><input id="sCnS" type="number" min="1" max="50"></div>
+    </div>
     <div class="grid">
       <div><label for="sPM">Preview model</label><input id="sPM" type="text"></div>
       <div><label for="sPS">Preview steps</label><input id="sPS" type="text"></div>
@@ -170,6 +181,7 @@ const MERGE_MARGIN = 50;           // strokes this close join an existing sketch
 
 const DEFAULTS = {
   key: '', style: '',
+  engine: 'controlnet', cnModel: 'fal-ai/fast-sdxl-controlnet-canny', cnPreviewSteps: 12, cnSteps: 25, cnScale: 0.8,
   previewModel: 'fal-ai/fast-lightning-sdxl/image-to-image', previewSteps: '2',
   refine: true,
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
@@ -214,7 +226,7 @@ let current = null;
 let seenPen = false;
 let showLines = true;
 let scale = 1;
-const speech = { on: false, rec: null, log: [], interim: '', interimAt: 0, llmWarned: false };   // log: {t, text, regionId}
+const speech = { on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
 
 // ---------- layout ----------
 function layout(){
@@ -402,7 +414,7 @@ board.addEventListener('pointerdown', e => {
   try { board.setPointerCapture(e.pointerId); } catch {}
   const p = toWorld(e);
   focusShift(p);
-  current = { id: e.pointerId, pts: [[p.x, p.y, penWidth(e)]] };
+  current = { id: e.pointerId, pts: [[p.x, p.y, penWidth(e)]], t0: performance.now() };
   inkX.fillStyle = '#111';
   inkX.beginPath(); inkX.arc(p.x, p.y, penWidth(e)/2, 0, Math.PI*2); inkX.fill();
 });
@@ -427,6 +439,7 @@ board.addEventListener('pointermove', e => {
 function endStroke(e){
   if (!current || e.pointerId !== current.id) return;
   const st = current; current = null;
+  st.t1 = performance.now();
   addStroke(st);
   redrawInk();
 }
@@ -469,7 +482,7 @@ function startListening(){
   speech.on = true; updateMic(); startRec();
 }
 function stopListening(){
-  speech.on = false; speech.interim = '';
+  speech.on = false; speech.interim = ''; speech.uttStart = 0;
   if (speech.rec) try { speech.rec.stop(); } catch {}
   updateMic(); showCaption();
 }
@@ -481,9 +494,11 @@ function startRec(){
     let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++){
       const res = e.results[i];
-      if (res.isFinal) addSpeech(res[0].transcript); else interim += res[0].transcript;
+      if (res.isFinal){ addSpeech(res[0].transcript, speech.uttStart || performance.now()); speech.uttStart = 0; }
+      else interim += res[0].transcript;
     }
     speech.interim = interim.trim();
+    if (speech.interim && !speech.uttStart) speech.uttStart = performance.now();   // when you started saying it
     if (speech.interim) speech.interimAt = performance.now();
     showCaption();
   };
@@ -504,22 +519,33 @@ function updateMic(){
   $('btnMic').textContent = speech.on ? 'Listening' : 'Listen';
 }
 
-// words go to the sketch being drawn; if none, to one whose last stroke was a moment ago (it repaints),
-// otherwise they wait a few seconds for the next sketch to start
-function addSpeech(text){
+// Safari can finalise a sentence seconds after it was said, so words are placed by when you started
+// saying them: they go to the sketch you were drawing then; else to one finished just before (it
+// repaints); else they wait for the next sketch you start within a few seconds
+function addSpeech(text, ts){
   text = text.trim(); if (!text) return;
   const now = performance.now();
   const last = speech.log[speech.log.length - 1];
   if (last && last.text === text && now - last.t < 3000) return;          // Safari sometimes repeats a final result
-  const seg = { t: now, text, regionId: null };
+  const seg = { t: ts, text, regionId: null };
   speech.log.push(seg);
   if (speech.log.length > 300) speech.log.shift();
-  const newest = list => list.sort((a, b) => b.lastStroke - a.lastStroke)[0];
-  const active = newest(regions.filter(r => r.status === 'waiting'));
-  const r = active || newest(regions.filter(r => now - r.lastStroke < 6000));
-  if (!r) return;
-  seg.regionId = r.id;
-  if (!active && r.status !== 'queued') touch(r);                          // already painting: paint again with the new words
+  const best = sketchAt(ts, now);
+  if (!best) return;
+  seg.regionId = best.id;
+  if (best.status !== 'waiting' && best.status !== 'queued') touch(best);  // already painting: paint again with the new words
+}
+// the sketch drawn while you spoke (from ts until to), else the one finished just before you began
+function sketchAt(ts, to){
+  let best = null, bestOverlap = 0;
+  for (const r of regions){
+    let overlap = 0;
+    for (const st of r.strokes) overlap += Math.max(0, Math.min(st.t1 || to, to) - Math.max(st.t0 || 0, ts - 1500));
+    if (overlap > bestOverlap){ best = r; bestOverlap = overlap; }
+  }
+  if (best) return best;
+  const before = regions.filter(r => r.lastStroke <= ts && ts - r.lastStroke < 6000);
+  return before.sort((a, b) => b.lastStroke - a.lastStroke)[0] || null;
 }
 function claimRecentSpeech(r){
   const now = performance.now();
@@ -527,8 +553,8 @@ function claimRecentSpeech(r){
 }
 function heardFor(r){
   const parts = speech.log.filter(seg => seg.regionId === r.id).map(seg => seg.text);
-  const newest = regions.reduce((a, b) => (!a || b.lastStroke > a.lastStroke) ? b : a, null);
-  if (speech.interim && newest === r) parts.push(speech.interim);         // Safari can hold the last words as interim
+  if (speech.interim && sketchAt(speech.uttStart || performance.now(), performance.now()) === r)
+    parts.push(speech.interim);                                            // Safari can hold the last words as interim
   return parts.join(' ').trim();
 }
 function sceneText(){
@@ -634,7 +660,14 @@ function snapshot(r){
   mx.imageSmoothingEnabled = true; mx.imageSmoothingQuality = 'high';
   mx.drawImage(f, 0, 0, ms, ms);
   mx.globalCompositeOperation = 'source-over';
-  return { x, y, s, url, mask: m };
+  // edge map for ControlNet: only this sketch, white lines on black
+  const ctl = document.createElement('canvas'); ctl.width = ctl.height = GEN;
+  const cx2 = ctl.getContext('2d');
+  cx2.fillStyle = '#000'; cx2.fillRect(0, 0, GEN, GEN);
+  cx2.save(); cx2.scale(GEN / s, GEN / s); cx2.translate(-x, -y);
+  for (const st of r.strokes) drawStroke(cx2, st, '#fff');
+  cx2.restore();
+  return { x, y, s, url, control: ctl.toDataURL('image/png'), mask: m };
 }
 
 // cheap blur: downscale then upscale with smoothing
@@ -664,9 +697,20 @@ async function safeFetch(url, opts){
   }
 }
 
-async function generate(model, steps, url, prompt, seed, signal){
+const isControl = model => /controlnet|canny/i.test(model);
+// pass = 'preview' | 'refine'; the engine picks the model and how the sketch is sent
+function job(pass){
+  if (S.engine === 'controlnet') return { model: S.cnModel, steps: pass === 'preview' ? S.cnPreviewSteps : S.cnSteps };
+  return pass === 'preview' ? { model: S.previewModel, steps: S.previewSteps } : { model: S.refineModel, steps: S.refineSteps };
+}
+async function generate(model, steps, snap, prompt, seed, signal){
   if (!S.key) throw new Error('Add your fal.ai key in Settings.');
-  const input = { prompt, image_url: url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety };
+  const control = isControl(model);
+  const input = control
+    ? { prompt, control_image_url: snap.control, controlnet_conditioning_scale: Number(S.cnScale), image_size: 'square_hd',
+        negative_prompt: 'blurry, lowres, extra objects, scenery, busy background, frame, text, watermark',
+        seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety }
+    : { prompt, image_url: snap.url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety };
   if (String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
   const res = await safeFetch('https://fal.run/' + model.trim(), {
     method: 'POST', signal,
@@ -675,6 +719,10 @@ async function generate(model, steps, url, prompt, seed, signal){
   });
   if (!res.ok){
     let t = ''; try { t = await res.text(); } catch {}
+    if (control && [400, 404, 405, 422].includes(res.status)){                 // endpoint or its inputs not as expected:
+      if (!speech.cnWarned){ speech.cnWarned = true; toast('ControlNet request failed (' + res.status + ': ' + t.slice(0, 160) + '). Using the fast model instead.'); }
+      return generate(S.previewModel, S.previewSteps, snap, prompt, seed, signal);   // keep painting with the fast model
+    }
     throw new Error('fal.ai ' + res.status + ': ' + t.slice(0, 240));
   }
   const j = await res.json();
@@ -700,9 +748,9 @@ function isBlank(bmp){
   return max < 12;
 }
 // a flagged result is usually a false positive on a rough sketch: try a few other seeds
-async function generateSafe(model, steps, url, prompt, seed, signal, tries = 3){
+async function generateSafe(model, steps, snap, prompt, seed, signal, tries = 3){
   for (let i = 0; ; i++){
-    try { return { bmp: await generate(model, steps, url, prompt, seed, signal), seed }; }
+    try { return { bmp: await generate(model, steps, snap, prompt, seed, signal), seed }; }
     catch (e){
       if (e.name !== 'BlockedError' || i >= tries - 1) throw e;
       seed = Math.floor(Math.random() * 2147483647);
@@ -736,14 +784,16 @@ async function runJob(r){
     prompt = buildPrompt(await describe(r, ac.signal));
     r.lastPrompt = prompt;
     if (r.version !== version || !regions.includes(r)) return;
-    const a = await generateSafe(S.previewModel, S.previewSteps, snap.url, prompt, seed, ac.signal);
+    const pv = job('preview');
+    const a = await generateSafe(pv.model, pv.steps, snap, prompt, seed, ac.signal);
     if (r.version !== version || !regions.includes(r)) return;     // sketch changed meanwhile: drop stale result
     applyResult(r, a.bmp, snap, slot);
     r.timing = Math.round(performance.now() - t0);
     if (S.refine){
       setStatus(r, 'refining');
       let b = null;
-      try { b = await generate(S.refineModel, S.refineSteps, snap.url, prompt, a.seed, ac.signal); }
+      const rf = job('refine');
+      try { b = await generate(rf.model, rf.steps, snap, prompt, a.seed, ac.signal); }
       catch (e){ if (e.name !== 'BlockedError') throw e; }            // blocked refine: keep the preview
       if (r.version !== version || !regions.includes(r)) return;
       if (b) applyResult(r, b, snap, slot);
@@ -827,7 +877,7 @@ $('btnExport').onclick = () => {
 };
 
 // ---------- settings sheet ----------
-const FIELDS = [['sKey','key'],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
+const FIELDS = [['sKey','key'],['sEngine','engine'],['sCnM','cnModel'],['sCnScale','cnScale',Number],['sCnPS','cnPreviewSteps',Number],['sCnS','cnSteps',Number],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
