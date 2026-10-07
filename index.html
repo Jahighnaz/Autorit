@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>Sketchboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✏️</text></svg>">
+<style>
+:root{
+  --chrome:#DCE3DD; --chrome-2:#CBD4CD; --ink:#22302A; --muted:#5A6B61; --line:#AEBBB2;
+  --accent:#2F4BD8; --busy:#B7790A; --ok:#2E8B57; --err:#C0392B;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){ --chrome:#26302B; --chrome-2:#323D37; --ink:#E3EAE5; --muted:#9FB0A6; --line:#46534B; }
+}
+*,*::before,*::after{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  background:var(--chrome); color:var(--ink);
+  font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  display:flex; flex-direction:column; overflow:hidden;
+  -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
+  overscroll-behavior:none;
+}
+header{display:flex;gap:6px;align-items:center;padding:8px 12px;flex-wrap:wrap}
+header h1{font-size:17px;font-weight:650;letter-spacing:-.01em;margin:0 8px 0 2px}
+#style{flex:1 1 220px;min-width:160px}
+input[type=text],input[type=password],input[type=number],select{
+  font:inherit;color:var(--ink);background:var(--chrome-2);border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;width:100%;-webkit-user-select:text;user-select:text;
+}
+button{
+  font:inherit;color:var(--ink);background:var(--chrome-2);border:1px solid var(--line);
+  border-radius:8px;padding:8px 12px;cursor:pointer;white-space:nowrap;
+}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+button[aria-pressed="false"]{opacity:.55}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#stage{flex:1;position:relative;min-height:0}
+#board{position:absolute;background:#fff;border-radius:4px;touch-action:none;
+  box-shadow:0 0 0 1px var(--line),0 10px 30px rgba(20,35,28,.18)}
+#board canvas{position:absolute;inset:0;width:100%;height:100%;border-radius:4px}
+#hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;
+  color:#8A968F;font-size:18px;text-align:center;padding:24px;line-height:1.5}
+.chip{position:absolute;transform:translateY(calc(-100% - 4px));display:flex;align-items:center;gap:6px;
+  background:#fff;color:#22302A;border:1px solid #C9D2CC;border-radius:999px;padding:3px 10px 3px 8px;
+  font-size:12.5px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.08);touch-action:manipulation}
+.chip i{width:8px;height:8px;border-radius:50%;background:#9AA59F;flex:none}
+.chip[data-s="queued"] i,.chip[data-s="waiting"] i{background:var(--accent)}
+.chip[data-s="preview"] i,.chip[data-s="refining"] i{background:var(--busy);animation:pulse 1s infinite alternate}
+.chip[data-s="done"] i{background:var(--ok)}
+.chip[data-s="error"] i{background:var(--err)}
+@keyframes pulse{to{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.chip i{animation:none!important}}
+.sheet{position:fixed;inset:0;background:rgba(10,20,15,.35);display:none;align-items:center;justify-content:center;padding:16px;z-index:10}
+.sheet.open{display:flex}
+.panel{background:var(--chrome);color:var(--ink);border-radius:14px;padding:18px;width:min(520px,100%);
+  max-height:90%;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.panel h2{font-size:18px;margin:0 0 12px}
+.panel label{display:block;margin:10px 0 4px;font-size:13px;color:var(--muted)}
+.panel .row{display:flex;gap:8px;align-items:center;margin-top:14px;flex-wrap:wrap}
+.panel .grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.panel p.note{font-size:13px;color:var(--muted);margin:6px 0 0}
+.check{display:flex!important;gap:8px;align-items:center;color:var(--ink)!important;font-size:15px!important}
+#toast{position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);
+  background:#22302A;color:#fff;padding:10px 14px;border-radius:10px;font-size:14px;max-width:90%;
+  opacity:0;pointer-events:none;transition:opacity .2s}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>Sketchboard</h1>
+  <input id="style" type="text" placeholder="Style for the whole board, e.g. watercolor, warm evening light" aria-label="Board style">
+  <button id="btnGen" class="primary" title="Paint every unfinished sketch now">Paint now</button>
+  <button id="btnUndo" title="Remove the last stroke">Undo</button>
+  <button id="btnSketch" aria-pressed="true" title="Show or hide sketch lines over painted areas">Lines</button>
+  <button id="btnExport">Export</button>
+  <button id="btnClear">Clear</button>
+  <button id="btnSettings" aria-label="Settings">Settings</button>
+</header>
+
+<div id="stage">
+  <div id="board">
+    <canvas id="gen"></canvas>
+    <canvas id="ink"></canvas>
+    <div id="hint">Draw with Apple Pencil.<br>When you move on to another spot, the sketch gets painted.</div>
+  </div>
+</div>
+
+<div class="sheet" id="regionSheet">
+  <div class="panel" role="dialog" aria-labelledby="rsTitle">
+    <h2 id="rsTitle">This sketch</h2>
+    <label for="rsPrompt">What is it? (optional, improves results)</label>
+    <input id="rsPrompt" type="text" placeholder="e.g. a lighthouse on a cliff">
+    <div class="row">
+      <button id="rsPaint" class="primary">Paint again</button>
+      <button id="rsRevert">Revert last painting</button>
+      <button id="rsDelete">Delete sketch</button>
+      <button id="rsClose">Close</button>
+    </div>
+    <p class="note" id="rsInfo"></p>
+  </div>
+</div>
+
+<div class="sheet" id="settingsSheet">
+  <div class="panel" role="dialog" aria-labelledby="stTitle">
+    <h2 id="stTitle">Settings</h2>
+    <label for="sKey">fal.ai API key</label>
+    <input id="sKey" type="password" placeholder="key-id:key-secret" autocomplete="off">
+    <p class="note">Stored only in this browser. Anyone with access to this page in your browser can read it, so keep the page private.</p>
+    <div class="grid">
+      <div><label for="sPM">Preview model</label><input id="sPM" type="text"></div>
+      <div><label for="sPS">Preview steps</label><input id="sPS" type="text"></div>
+      <div><label for="sRM">Refine model</label><input id="sRM" type="text"></div>
+      <div><label for="sRS">Refine steps</label><input id="sRS" type="text"></div>
+      <div><label for="sStr">Strength (0.5–1)</label><input id="sStr" type="number" step="0.05" min="0.3" max="1"></div>
+      <div><label for="sPar">Parallel jobs</label><input id="sPar" type="number" min="1" max="4"></div>
+      <div><label for="sDwell">Pause before painting (ms)</label><input id="sDwell" type="number" step="100" min="300"></div>
+      <div><label for="sLeave">Move-away distance (px)</label><input id="sLeave" type="number" step="10" min="20"></div>
+      <div><label for="sCtx">Context around sketch (0–1)</label><input id="sCtx" type="number" step="0.05" min="0" max="1"></div>
+      <div><label for="sBrush">Pen size</label><input id="sBrush" type="number" step="0.5" min="1" max="20"></div>
+    </div>
+    <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
+    <label class="check"><input id="sPen" type="checkbox"> Only Apple Pencil draws (fingers tap)</label>
+    <div class="row">
+      <button id="sSave" class="primary">Save settings</button>
+      <button id="sCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status"></div>
+
+<script>
+(() => {
+'use strict';
+
+// ---------- constants & settings ----------
+const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
+const GEN = 1024;                  // size sent to the model
+const MERGE_MARGIN = 50;           // strokes this close join an existing sketch
+
+const DEFAULTS = {
+  key: '', style: '',
+  previewModel: 'fal-ai/fast-lightning-sdxl/image-to-image', previewSteps: '2',
+  refine: true,
+  refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
+  strength: 0.9, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
+};
+function loadSettings(){
+  try { return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem('sketchboard.settings') || '{}')); }
+  catch { return Object.assign({}, DEFAULTS); }
+}
+function saveSettings(){
+  try { localStorage.setItem('sketchboard.settings', JSON.stringify(S)); } catch {}
+}
+const S = loadSettings();
+
+// ---------- DOM ----------
+const $ = id => document.getElementById(id);
+const stage = $('stage'), board = $('board'), hint = $('hint');
+const genC = $('gen'), inkC = $('ink');
+genC.width = inkC.width = W; genC.height = inkC.height = H;
+const genX = genC.getContext('2d'), inkX = inkC.getContext('2d');
+const othersC = document.createElement('canvas'); othersC.width = W; othersC.height = H;
+const othersX = othersC.getContext('2d');
+
+// ---------- state ----------
+let regions = [];        // {id, strokes[], bbox, version, lastTouched, status, prompt, err, abort, timer, chip}
+let results = [];        // {regionId, canvas, x, y, s, t}
+let strokeOrder = [];    // stack of strokes for undo
+let queue = [];
+let running = 0;
+let nextId = 1;
+let current = null;
+let seenPen = false;
+let showLines = true;
+let scale = 1;
+
+// ---------- layout ----------
+function layout(){
+  const r = stage.getBoundingClientRect();
+  const pad = 12;
+  scale = Math.min((r.width - pad*2) / W, (r.height - pad*2) / H);
+  const w = W*scale, h = H*scale;
+  board.style.width = w + 'px'; board.style.height = h + 'px';
+  board.style.left = (r.width - w)/2 + 'px'; board.style.top = (r.height - h)/2 + 'px';
+  regions.forEach(placeChip);
+}
+window.addEventListener('resize', layout);
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+function toWorld(e){
+  const r = board.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+
+// ---------- drawing ----------
+function penWidth(e){
+  const p = e.pointerType === 'pen' ? (e.pressure || 0.5) : 0.5;
+  return S.brush * (0.35 + p * 1.3);
+}
+function segment(ctx, a, b){
+  ctx.lineWidth = (a[2] + b[2]) / 2;
+  ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+}
+function drawStroke(ctx, st, color, widthMul = 1){
+  ctx.strokeStyle = color; ctx.fillStyle = color;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const p = st.pts;
+  if (p.length === 1){
+    ctx.beginPath(); ctx.arc(p[0][0], p[0][1], p[0][2]*widthMul/2, 0, Math.PI*2); ctx.fill(); return;
+  }
+  if (widthMul !== 1){
+    ctx.lineWidth = widthMul; ctx.beginPath(); ctx.moveTo(p[0][0], p[0][1]);
+    for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]);
+    ctx.stroke(); return;
+  }
+  for (let i = 1; i < p.length; i++) segment(ctx, p[i-1], p[i]);
+}
+function hasResult(id){ return results.some(r => r.regionId === id); }
+
+function redrawInk(){
+  inkX.clearRect(0, 0, W, H);
+  for (const r of regions){
+    const painted = hasResult(r.id);
+    const alpha = painted ? (showLines ? 0.18 : 0) : 1;
+    if (alpha > 0){
+      inkX.globalAlpha = alpha;
+      for (const st of r.strokes) drawStroke(inkX, st, '#111');
+      inkX.globalAlpha = 1;
+    }
+    if (['waiting','queued','preview','refining'].includes(r.status)){
+      const b = r.bbox;
+      inkX.save();
+      inkX.setLineDash([10, 8]); inkX.lineWidth = 2; inkX.strokeStyle = 'rgba(47,75,216,.45)';
+      inkX.strokeRect(b.x0 - 12, b.y0 - 12, b.x1 - b.x0 + 24, b.y1 - b.y0 + 24);
+      inkX.restore();
+    }
+  }
+}
+
+function composeGen(){
+  genX.clearRect(0, 0, W, H);
+  for (const res of results) genX.drawImage(res.canvas, res.x, res.y, res.s, res.s);
+}
+function composeOthers(excludeId){
+  othersX.clearRect(0, 0, W, H);
+  for (const res of results) if (res.regionId !== excludeId) othersX.drawImage(res.canvas, res.x, res.y, res.s, res.s);
+  return othersC;
+}
+
+// ---------- regions ----------
+function strokeBox(st){
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y, w] of st.pts){ x0 = Math.min(x0, x - w); y0 = Math.min(y0, y - w); x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + w); }
+  return { x0, y0, x1, y1 };
+}
+function unionBox(a, b){ return { x0: Math.min(a.x0,b.x0), y0: Math.min(a.y0,b.y0), x1: Math.max(a.x1,b.x1), y1: Math.max(a.y1,b.y1) }; }
+function intersects(a, b, m){ return a.x0 - m < b.x1 && a.x1 + m > b.x0 && a.y0 - m < b.y1 && a.y1 + m > b.y0; }
+function distToBox(p, b){
+  const dx = Math.max(b.x0 - p.x, 0, p.x - b.x1), dy = Math.max(b.y0 - p.y, 0, p.y - b.y1);
+  return Math.hypot(dx, dy);
+}
+function recomputeBox(r){
+  r.bbox = r.strokes.map(strokeBox).reduce(unionBox);
+}
+
+function addStroke(st){
+  const box = strokeBox(st);
+  const hits = regions.filter(r => intersects(r.bbox, box, MERGE_MARGIN));
+  let r;
+  if (!hits.length){
+    r = { id: nextId++, strokes: [], bbox: box, version: 0, lastTouched: 0, status: 'waiting', prompt: '', err: '', abort: null, timer: null, chip: null };
+    regions.push(r); makeChip(r);
+  } else {
+    r = hits[0];
+    for (const o of hits.slice(1)){            // merge neighbours into one sketch
+      if (o.abort) o.abort.abort();
+      clearTimeout(o.timer);
+      r.strokes.push(...o.strokes);
+      o.strokes.forEach(s => s.regionId = r.id);
+      results.forEach(res => { if (res.regionId === o.id) res.regionId = r.id; });
+      if (o.prompt && !r.prompt) r.prompt = o.prompt;
+      removeRegion(o, false);
+    }
+  }
+  st.regionId = r.id;
+  r.strokes.push(st);
+  recomputeBox(r);
+  touch(r);
+  strokeOrder.push(st);
+  hint.style.display = 'none';
+}
+
+function touch(r){
+  r.version++; r.lastTouched = performance.now();
+  if (r.abort) r.abort.abort();
+  queue = queue.filter(q => q !== r);
+  setStatus(r, 'waiting');
+  clearTimeout(r.timer);
+  r.timer = setTimeout(() => enqueue(r), S.dwell);
+}
+
+function removeRegion(r, dropResults = true){
+  if (r.abort) r.abort.abort();
+  clearTimeout(r.timer);
+  queue = queue.filter(q => q !== r);
+  if (dropResults) results = results.filter(res => res.regionId !== r.id);
+  if (r.chip) r.chip.remove();
+  regions = regions.filter(x => x !== r);
+}
+
+// focus shift: pen lands or hovers away from a sketch that is still waiting
+function focusShift(p){
+  for (const r of regions){
+    if (r.status === 'waiting' && distToBox(p, r.bbox) > S.leave) enqueue(r);
+  }
+}
+
+// ---------- chips ----------
+const LABELS = { waiting: 'Sketching', queued: 'Up next', preview: 'Painting', refining: 'Refining', done: 'Done', error: 'Failed, tap' };
+function makeChip(r){
+  const c = document.createElement('button');
+  c.className = 'chip'; c.type = 'button';
+  c.innerHTML = '<i></i><span></span>';
+  c.addEventListener('pointerdown', e => e.stopPropagation());
+  c.addEventListener('click', () => openRegion(r));
+  board.appendChild(c); r.chip = c;
+}
+function placeChip(r){
+  if (!r.chip) return;
+  r.chip.style.left = (r.bbox.x0 * scale) + 'px';
+  r.chip.style.top = (Math.max(r.bbox.y0 - 12, 28 / scale) * scale) + 'px';
+}
+function setStatus(r, s){
+  r.status = s;
+  if (r.chip){
+    r.chip.dataset.s = s;
+    r.chip.querySelector('span').textContent = LABELS[s] || s;
+    r.chip.title = s === 'error' ? r.err : '';
+    placeChip(r);
+  }
+  redrawInk();
+}
+
+// ---------- pointer input ----------
+board.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'pen') seenPen = true;
+  if (S.penOnly && seenPen && e.pointerType === 'touch') return;
+  if (e.button > 0) return;
+  e.preventDefault();
+  try { board.setPointerCapture(e.pointerId); } catch {}
+  const p = toWorld(e);
+  focusShift(p);
+  current = { id: e.pointerId, pts: [[p.x, p.y, penWidth(e)]] };
+  inkX.fillStyle = '#111';
+  inkX.beginPath(); inkX.arc(p.x, p.y, penWidth(e)/2, 0, Math.PI*2); inkX.fill();
+});
+
+board.addEventListener('pointermove', e => {
+  if (current && e.pointerId === current.id){
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    inkX.strokeStyle = '#111'; inkX.lineCap = 'round'; inkX.lineJoin = 'round';
+    for (const ev of (evs.length ? evs : [e])){
+      const p = toWorld(ev);
+      const pt = [p.x, p.y, penWidth(ev)];
+      const last = current.pts[current.pts.length - 1];
+      if (Math.hypot(pt[0] - last[0], pt[1] - last[1]) < 1.2) continue;
+      current.pts.push(pt);
+      segment(inkX, last, pt);
+    }
+  } else if (e.pointerType === 'pen' && e.buttons === 0){
+    focusShift(toWorld(e));                   // Pencil hover (M2+ iPads)
+  }
+});
+
+function endStroke(e){
+  if (!current || e.pointerId !== current.id) return;
+  const st = current; current = null;
+  addStroke(st);
+  redrawInk();
+}
+board.addEventListener('pointerup', endStroke);
+board.addEventListener('pointercancel', endStroke);
+
+// ---------- generation ----------
+function enqueue(r){
+  clearTimeout(r.timer);
+  if (!r.strokes.length || !regions.includes(r)) return;
+  if (!queue.includes(r)) queue.push(r);
+  setStatus(r, 'queued');
+  pump();
+}
+function pump(){
+  while (running < Math.max(1, S.parallel|0) && queue.length){
+    queue.sort((a, b) => b.lastTouched - a.lastTouched);   // most recent sketch first
+    const r = queue.shift();
+    running++;
+    runJob(r).finally(() => { running--; pump(); });
+  }
+}
+
+function buildPrompt(r){
+  const parts = [r.prompt.trim(), S.style.trim()].filter(Boolean);
+  return parts.length ? parts.join(', ') : 'detailed colorful illustration, clean composition';
+}
+
+function snapshot(r){
+  const b = r.bbox;
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  let s = Math.max(b.x1 - b.x0, b.y1 - b.y0) * (1 + 2 * S.context) + 40;
+  s = Math.round(Math.min(Math.max(s, 320), H));
+  const x = Math.round(Math.min(Math.max(cx - s/2, 0), W - s));
+  const y = Math.round(Math.min(Math.max(cy - s/2, 0), H - s));
+  const others = composeOthers(r.id);
+
+  // image for the model: existing paintings + this sketch (+ unpainted sketches nearby)
+  const src = document.createElement('canvas'); src.width = src.height = GEN;
+  const sx = src.getContext('2d');
+  sx.fillStyle = '#fff'; sx.fillRect(0, 0, GEN, GEN);
+  sx.drawImage(others, x, y, s, s, 0, 0, GEN, GEN);
+  sx.save(); sx.scale(GEN / s, GEN / s); sx.translate(-x, -y);
+  for (const o of regions){
+    if (o === r || !hasResult(o.id)) for (const st of o.strokes) drawStroke(sx, st, '#111');
+  }
+  sx.restore();
+  const url = src.toDataURL('image/jpeg', 0.9);
+
+  // blend mask: paint freely on empty paper, only near new strokes over existing paintings
+  const ms = Math.min(s, 1024);
+  const m = document.createElement('canvas'); m.width = m.height = ms;
+  const mx = m.getContext('2d');
+  mx.fillStyle = '#fff'; mx.fillRect(0, 0, ms, ms);
+  mx.globalCompositeOperation = 'destination-out';
+  mx.drawImage(others, x, y, s, s, 0, 0, ms, ms);
+  mx.globalCompositeOperation = 'source-over';
+  mx.save(); mx.scale(ms / s, ms / s); mx.translate(-x, -y);
+  for (const st of r.strokes) drawStroke(mx, st, '#fff', s * 0.12);
+  mx.restore();
+  softenMask(m, 40);
+  // feather the outer edge of the crop
+  const f = document.createElement('canvas'); f.width = f.height = 32;
+  const fx = f.getContext('2d'); fx.fillStyle = '#fff'; fx.fillRect(3, 3, 26, 26);
+  mx.globalCompositeOperation = 'destination-in';
+  mx.imageSmoothingEnabled = true; mx.imageSmoothingQuality = 'high';
+  mx.drawImage(f, 0, 0, ms, ms);
+  mx.globalCompositeOperation = 'source-over';
+  return { x, y, s, url, mask: m };
+}
+
+// cheap blur: downscale then upscale with smoothing
+function softenMask(c, n){
+  const t = document.createElement('canvas'); t.width = t.height = n;
+  const tx = t.getContext('2d');
+  tx.imageSmoothingEnabled = true; tx.imageSmoothingQuality = 'high';
+  tx.drawImage(c, 0, 0, n, n);
+  const cx = c.getContext('2d');
+  cx.clearRect(0, 0, c.width, c.height);
+  cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+  cx.drawImage(t, 0, 0, c.width, c.height);
+}
+
+// Some embedded previews proxy fetch() and cannot clone an AbortSignal.
+// Fall back to an un-signalled request and enforce cancellation ourselves.
+async function safeFetch(url, opts){
+  try { return await fetch(url, opts); }
+  catch (e){
+    const cloneErr = e && (e.name === 'DataCloneError' || /clone/i.test(e.message || ''));
+    if (!cloneErr || !opts || !opts.signal) throw e;
+    const { signal, ...rest } = opts;
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const res = await fetch(url, rest);
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    return res;
+  }
+}
+
+async function generate(model, steps, url, prompt, seed, signal){
+  if (!S.key) throw new Error('Add your fal.ai key in Settings.');
+  const input = { prompt, image_url: url, strength: Number(S.strength), seed, num_images: 1, sync_mode: true };
+  if (String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
+  const res = await safeFetch('https://fal.run/' + model.trim(), {
+    method: 'POST', signal,
+    headers: { 'Authorization': 'Key ' + S.key.trim(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(input)
+  });
+  if (!res.ok){
+    let t = ''; try { t = await res.text(); } catch {}
+    throw new Error('fal.ai ' + res.status + ': ' + t.slice(0, 240));
+  }
+  const j = await res.json();
+  const out = j.images && j.images[0] && j.images[0].url;
+  if (!out) throw new Error('fal.ai returned no image.');
+  const blob = await (await safeFetch(out, { signal })).blob();
+  return await createImageBitmap(blob);
+}
+
+function applyResult(r, bmp, snap, slot){
+  const c = document.createElement('canvas'); c.width = c.height = snap.mask.width;
+  const cx = c.getContext('2d');
+  cx.imageSmoothingQuality = 'high';
+  cx.drawImage(bmp, 0, 0, c.width, c.height);
+  cx.globalCompositeOperation = 'destination-in';
+  cx.drawImage(snap.mask, 0, 0);
+  if (slot.res){ slot.res.canvas = c; }
+  else { slot.res = { regionId: r.id, canvas: c, x: snap.x, y: snap.y, s: snap.s, t: performance.now() }; results.push(slot.res); }
+  composeGen(); redrawInk();
+}
+
+async function runJob(r){
+  const version = r.version;
+  if (r.abort) r.abort.abort();
+  const ac = new AbortController(); r.abort = ac;
+  const snap = snapshot(r);
+  const prompt = buildPrompt(r);
+  const seed = Math.floor(Math.random() * 2147483647);
+  const slot = {};
+  const t0 = performance.now();
+  try {
+    setStatus(r, 'preview');
+    const a = await generate(S.previewModel, S.previewSteps, snap.url, prompt, seed, ac.signal);
+    if (r.version !== version || !regions.includes(r)) return;     // sketch changed meanwhile: drop stale result
+    applyResult(r, a, snap, slot);
+    r.timing = Math.round(performance.now() - t0);
+    if (S.refine){
+      setStatus(r, 'refining');
+      const b = await generate(S.refineModel, S.refineSteps, snap.url, prompt, seed, ac.signal);
+      if (r.version !== version || !regions.includes(r)) return;
+      applyResult(r, b, snap, slot);
+    }
+    r.timingTotal = Math.round(performance.now() - t0);
+    setStatus(r, 'done');
+  } catch (err){
+    if (err.name === 'AbortError') return;
+    r.err = err.message || String(err);
+    if (err.name === 'TypeError' && /load failed|failed to fetch|network/i.test(r.err))
+      r.err = 'Could not reach fal.ai (' + r.err + '). If this page is open inside an app preview, open it in Safari instead.';
+    setStatus(r, 'error');
+    toast(r.err);
+  } finally {
+    if (r.abort === ac) r.abort = null;
+  }
+}
+
+// ---------- region sheet ----------
+let openR = null;
+function openRegion(r){
+  openR = r;
+  $('rsPrompt').value = r.prompt;
+  const info = [];
+  if (r.status === 'error') info.push(r.err);
+  if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
+  $('rsInfo').textContent = info.join(' ');
+  $('rsRevert').disabled = !hasResult(r.id);
+  $('regionSheet').classList.add('open');
+}
+function closeRegion(){ if (openR) openR.prompt = $('rsPrompt').value; $('regionSheet').classList.remove('open'); openR = null; }
+$('rsClose').onclick = closeRegion;
+$('rsPaint').onclick = () => { const r = openR; closeRegion(); if (r){ r.version++; r.lastTouched = performance.now(); enqueue(r); } };
+$('rsRevert').onclick = () => {
+  const r = openR; if (!r) return;
+  for (let i = results.length - 1; i >= 0; i--) if (results[i].regionId === r.id){ results.splice(i, 1); break; }
+  if (r.abort) r.abort.abort();
+  composeGen(); setStatus(r, hasResult(r.id) ? 'done' : 'waiting'); closeRegion();
+};
+$('rsDelete').onclick = () => {
+  const r = openR; if (!r) return;
+  strokeOrder = strokeOrder.filter(s => s.regionId !== r.id);
+  closeRegion(); removeRegion(r); composeGen(); redrawInk();
+};
+$('regionSheet').addEventListener('click', e => { if (e.target.id === 'regionSheet') closeRegion(); });
+
+// ---------- toolbar ----------
+$('style').value = S.style;
+$('style').addEventListener('change', () => { S.style = $('style').value; saveSettings(); });
+$('btnGen').onclick = () => regions.filter(r => r.status === 'waiting' || r.status === 'error').forEach(enqueue);
+$('btnUndo').onclick = () => {
+  const st = strokeOrder.pop(); if (!st) return;
+  const r = regions.find(x => x.id === st.regionId); if (!r) return;
+  r.strokes = r.strokes.filter(s => s !== st);
+  if (!r.strokes.length){ removeRegion(r); composeGen(); redrawInk(); return; }
+  recomputeBox(r); touch(r);
+};
+$('btnSketch').onclick = () => { showLines = !showLines; $('btnSketch').setAttribute('aria-pressed', String(showLines)); redrawInk(); };
+$('btnClear').onclick = () => {
+  if (!regions.length || !confirm('Clear the whole board?')) return;
+  [...regions].forEach(r => removeRegion(r));
+  results = []; strokeOrder = []; queue = [];
+  composeGen(); redrawInk(); hint.style.display = '';
+};
+$('btnExport').onclick = () => {
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
+  x.drawImage(genC, 0, 0);
+  for (const r of regions) if (!hasResult(r.id)) for (const st of r.strokes) drawStroke(x, st, '#111');
+  c.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = 'sketchboard.png';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  }, 'image/png');
+};
+
+// ---------- settings sheet ----------
+const FIELDS = [['sKey','key'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
+  ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sBrush','brush',Number]];
+function openSettings(){
+  for (const [id, k] of FIELDS) $(id).value = S[k];
+  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly;
+  $('settingsSheet').classList.add('open');
+}
+$('btnSettings').onclick = openSettings;
+$('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
+$('sSave').onclick = () => {
+  for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
+  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked;
+  saveSettings(); $('settingsSheet').classList.remove('open'); toast('Settings saved.');
+};
+
+// ---------- toast ----------
+let toastT = null;
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 4500);
+}
+
+layout();
+if (!S.key) openSettings();
+})();
+</script>
+</body>
+</html>
