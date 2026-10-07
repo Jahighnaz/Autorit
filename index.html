@@ -182,10 +182,11 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b7 colour fill';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b8 line-based joining';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
-const MERGE_MARGIN = 50;           // strokes this close join an existing sketch
+const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
+const NEAR_LINE = 28;              // ...and join if they come this close to its lines
 
 const DEFAULTS = {
   key: '', style: '',
@@ -328,9 +329,30 @@ function recomputeBox(r){
   r.bbox = r.strokes.map(strokeBox).reduce(unionBox);
 }
 
+// a stroke joins a sketch if it touches (comes close to) its lines or sits inside its closed outline
+// (seeds in a strawberry, eyes in a face); being near its bounding box is not enough
+function belongsTo(r, st, box){
+  if (!intersects(r.bbox, box, MERGE_MARGIN)) return false;
+  const near2 = NEAR_LINE * NEAR_LINE, step = Math.max(1, Math.floor(st.pts.length / 60));
+  for (let i = 0; i < st.pts.length; i += step){
+    const [px, py] = st.pts[i];
+    for (const o of r.strokes) for (const q of o.pts){
+      const dx = q[0] - px, dy = q[1] - py;
+      if (dx*dx + dy*dy < near2) return true;
+    }
+  }
+  const cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
+  const b = r.bbox, inBox = cx > b.x0 && cx < b.x1 && cy > b.y0 && cy < b.y1;
+  if (!inBox) return false;
+  const pad = 8, side = Math.max(b.x1 - b.x0, b.y1 - b.y0) + 2 * pad, n = 64;   // inside its closed outline?
+  const shape = shapeOf(r, b.x0 - pad, b.y0 - pad, side, n);
+  const sx = Math.floor((cx - b.x0 + pad) / side * n), sy = Math.floor((cy - b.y0 + pad) / side * n);
+  return shape.getContext('2d').getImageData(sx, sy, 1, 1).data[3] > 128;
+}
+
 function addStroke(st){
   const box = strokeBox(st);
-  const hits = regions.filter(r => intersects(r.bbox, box, MERGE_MARGIN));
+  const hits = regions.filter(r => belongsTo(r, st, box));
   let r;
   if (!hits.length){
     r = { id: nextId++, strokes: [], bbox: box, version: 0, lastTouched: 0, lastStroke: 0, status: 'waiting', prompt: '', err: '', abort: null, timer: null, chip: null };
