@@ -183,7 +183,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b10 filter-off fix';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b11 no sketch words';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -515,6 +515,7 @@ const MASTER_DEFAULT = 'You write the prompt for an image model that paints ONE 
   'From what was said about the whole picture, take only style, palette, lighting and mood, never extra objects. ' +
   'The speech can be in any language, rambling and full of filler; ignore anything not about the picture. ' +
   'Never mention children, kids, babies or anyone\'s age, nor nudity or bodies; say "naive drawing style" instead of "children\'s drawing". ' +
+  'Describe the finished painted object, not the drawing: never use the words sketch, drawing, pencil, outline or line art. ' +
   'Answer in English with exactly two lines. Line 1: the prompt only, at most 20 words, comma-separated, no quotes; if nothing describable was said: simple colorful drawing. ' +
   'Line 2: the main colour of that thing as a hex code, for example #d23a2a for a red apple or #f2d24b for a banana.';
 
