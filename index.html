@@ -30,7 +30,7 @@ body{
 header{display:flex;gap:6px;align-items:center;padding:8px 12px;flex-wrap:wrap}
 header h1{font-size:17px;font-weight:650;letter-spacing:-.01em;margin:0 8px 0 2px}
 #style{flex:1 1 220px;min-width:160px}
-input[type=text],input[type=password],input[type=number],select{
+input[type=text],input[type=password],input[type=number],select,textarea{
   font:inherit;color:var(--ink);background:var(--chrome-2);border:1px solid var(--line);
   border-radius:8px;padding:8px 10px;width:100%;-webkit-user-select:text;user-select:text;
 }
@@ -132,6 +132,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
       <div><label for="sLeave">Move-away distance (px)</label><input id="sLeave" type="number" step="10" min="20"></div>
       <div><label for="sCtx">Context around sketch (0–1)</label><input id="sCtx" type="number" step="0.05" min="0" max="1"></div>
       <div><label for="sBrush">Pen size</label><input id="sBrush" type="number" step="0.5" min="1" max="20"></div>
+      <div><label for="sNb">Neighbours shown to the model (0–1)</label><input id="sNb" type="number" step="0.05" min="0" max="1"></div>
     </div>
     <label for="sExtra">Always add to the prompt</label>
     <input id="sExtra" type="text">
@@ -143,6 +144,9 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
       <div><label for="sLlmEp">LLM endpoint</label><input id="sLlmEp" type="text"></div>
       <div><label for="sLlmModel">LLM model</label><input id="sLlmModel" type="text"></div>
     </div>
+    <label for="sMaster">Master prompt: how speech becomes the image prompt</label>
+    <textarea id="sMaster" rows="6"></textarea>
+    <p class="note">Sent to the LLM with every sketch's words. Clear it to restore the default.</p>
     <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
     <label class="check"><input id="sPen" type="checkbox"> Only Apple Pencil draws (fingers tap)</label>
     <div class="row">
@@ -168,15 +172,18 @@ const DEFAULTS = {
   previewModel: 'fal-ai/fast-lightning-sdxl/image-to-image', previewSteps: '2',
   refine: true,
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
-  extra: 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork',
-  lang: '', llm: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
+  extra: 'fully painted, vivid saturated colors, rich detail, single subject on plain white paper',
+  neighbours: 0.35,
+  lang: '', llm: true, master: '', llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
-const SETTINGS_V = 2;
+const SETTINGS_V = 3;
+const OLD_EXTRA = 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork';
 function loadSettings(){
   try {
     const saved = JSON.parse(localStorage.getItem('sketchboard.settings') || '{}');
     if ((saved.v || 1) < 2 && saved.strength === 0.9) delete saved.strength;   // old default was too weak to paint
+    if ((saved.v || 1) < 3 && saved.extra === OLD_EXTRA) delete saved.extra;   // old default invited whole scenes
     return Object.assign({}, DEFAULTS, saved, { v: SETTINGS_V });
   }
   catch { return Object.assign({}, DEFAULTS, { v: SETTINGS_V }); }
@@ -448,10 +455,12 @@ function buildPrompt(subject){
 
 // ---------- speech ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const LLM_SYSTEM = 'You turn what an artist says out loud while sketching into a short English prompt for an image model (Stable Diffusion XL). ' +
-  'The speech can be in any language, rambling, and full of filler words. Describe what this sketch depicts, adding setting, colours, ' +
-  'lighting and mood from the speech about the whole picture when they fit. Ignore talk that is not about the picture. ' +
-  'Answer with the prompt only: at most 30 words, comma-separated phrases, no quotes. If nothing describable was said, answer: colorful illustration';
+const MASTER_DEFAULT = 'You write the prompt for an image model that paints ONE pencil sketch on a shared drawing board, while the artist talks. ' +
+  'Only the sketch itself gets painted; the rest of the board is already done, so never ask for a scene, a background, other objects or more of anything. ' +
+  'From what was said while drawing this sketch, name the single thing it shows and its look (colour, material, pose). ' +
+  'From what was said about the whole picture, take only style, palette, lighting and mood, never extra objects. ' +
+  'The speech can be in any language, rambling and full of filler; ignore anything not about the picture. ' +
+  'Answer in English with the prompt only: at most 20 words, comma-separated, no quotes. If nothing describable was said, answer: simple colorful drawing';
 
 function startListening(){
   if (!SR){ toast('Speech recognition is not available in this browser. Use Safari or Chrome.'); return; }
@@ -544,7 +553,7 @@ async function describe(r, signal){
   const scene = sceneText();
   if (!S.llm) return r.heard;
   if (!r.heard && !scene) return '';
-  const key = r.heard + '|' + scene;
+  const key = r.heard + '|' + scene + '|' + S.master;
   if (r.llmKey === key) return r.llmPrompt;
   try {
     const p = await speechToPrompt(r.heard, scene, signal);
@@ -564,7 +573,7 @@ async function speechToPrompt(heard, scene, signal){
     const res = await safeFetch('https://fal.run/' + S.llmEndpoint.trim(), {
       method: 'POST', signal: ac.signal,
       headers: { 'Authorization': 'Key ' + S.key.trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: S.llmModel.trim(), system_prompt: LLM_SYSTEM,
+      body: JSON.stringify({ model: S.llmModel.trim(), system_prompt: S.master.trim() || MASTER_DEFAULT,
         prompt: 'Said while drawing this sketch: "' + (heard || '(nothing)') + '"\nSaid recently about the whole picture: "' + (scene || '(nothing)') + '"' })
     });
     if (!res.ok){ let t = ''; try { t = await res.text(); } catch {} throw new Error('LLM ' + res.status + ': ' + t.slice(0, 200)); }
@@ -584,28 +593,36 @@ function snapshot(r){
   const y = Math.round(Math.min(Math.max(cy - s/2, 0), H - s));
   const others = composeOthers(r.id);
 
-  // image for the model: existing paintings + this sketch (+ unpainted sketches nearby)
+  // image for the model: this sketch at full strength; neighbouring paintings and sketches faded,
+  // so they set colour and style but are not read as things to draw again
+  const fade = Math.min(Math.max(Number(S.neighbours), 0), 1);
   const src = document.createElement('canvas'); src.width = src.height = GEN;
   const sx = src.getContext('2d');
   sx.fillStyle = '#fff'; sx.fillRect(0, 0, GEN, GEN);
+  sx.globalAlpha = fade;
   sx.drawImage(others, x, y, s, s, 0, 0, GEN, GEN);
   sx.save(); sx.scale(GEN / s, GEN / s); sx.translate(-x, -y);
-  for (const o of regions){
-    if (o === r || !hasResult(o.id)) for (const st of o.strokes) drawStroke(sx, st, '#111');
-  }
+  for (const o of regions) if (o !== r && !hasResult(o.id)) for (const st of o.strokes) drawStroke(sx, st, '#111');
+  sx.globalAlpha = 1;
+  for (const st of r.strokes) drawStroke(sx, st, '#111');
   sx.restore();
   const url = src.toDataURL('image/jpeg', 0.9);
 
-  // blend mask: paint freely on empty paper, only near new strokes over existing paintings
+  // blend mask: keep only the sketch's own footprint (its box plus a margin), give way to existing
+  // paintings except right along the new strokes, and feather the edge so it melts into the board
   const ms = Math.min(s, 1024);
   const m = document.createElement('canvas'); m.width = m.height = ms;
   const mx = m.getContext('2d');
-  mx.fillStyle = '#fff'; mx.fillRect(0, 0, ms, ms);
+  const size = Math.max(b.x1 - b.x0, b.y1 - b.y0);
+  const pad = Math.max(16, size * 0.08);
+  mx.save(); mx.scale(ms / s, ms / s); mx.translate(-x, -y);
+  mx.fillStyle = '#fff'; mx.fillRect(b.x0 - pad, b.y0 - pad, b.x1 - b.x0 + 2*pad, b.y1 - b.y0 + 2*pad);
+  mx.restore();
   mx.globalCompositeOperation = 'destination-out';
   mx.drawImage(others, x, y, s, s, 0, 0, ms, ms);
   mx.globalCompositeOperation = 'source-over';
   mx.save(); mx.scale(ms / s, ms / s); mx.translate(-x, -y);
-  for (const st of r.strokes) drawStroke(mx, st, '#fff', s * 0.12);
+  for (const st of r.strokes) drawStroke(mx, st, '#fff', Math.max(12, size * 0.06));
   mx.restore();
   softenMask(m, 40);
   // feather the outer edge of the crop
@@ -809,10 +826,11 @@ $('btnExport').onclick = () => {
 
 // ---------- settings sheet ----------
 const FIELDS = [['sKey','key'],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
-  ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sBrush','brush',Number]];
+  ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
   $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm;
+  $('sMaster').value = S.master.trim() || MASTER_DEFAULT;
   $('settingsSheet').classList.add('open');
 }
 $('btnSettings').onclick = openSettings;
@@ -820,6 +838,8 @@ $('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
 $('sSave').onclick = () => {
   for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
   S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked;
+  const master = $('sMaster').value.trim();
+  S.master = master === MASTER_DEFAULT ? '' : master;
   if (speech.on){ stopListening(); startListening(); }                    // pick up a new language
   saveSettings(); $('settingsSheet').classList.remove('open'); toast('Settings saved.');
 };
