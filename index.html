@@ -163,7 +163,9 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
       <div><label for="sLlmEp">LLM endpoint</label><input id="sLlmEp" type="text"></div>
       <div><label for="sLlmModel">LLM model</label><input id="sLlmModel" type="text"></div>
     </div>
-    <label for="sMaster">Master prompt: how speech becomes the image prompt</label>
+    <label for="sAnalysis">Analysis prompt: how your talk becomes the running brief</label>
+    <textarea id="sAnalysis" rows="5"></textarea>
+    <label for="sMaster">Master prompt: how the brief and a sketch's words become its image prompt</label>
     <textarea id="sMaster" rows="6"></textarea>
     <p class="note">Sent to the LLM with every sketch's words. Clear it to restore the default.</p>
     <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
@@ -183,7 +185,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b11 no sketch words';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b12 brief + groups';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -197,10 +199,10 @@ const DEFAULTS = {
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
   extra: 'fully painted, vivid saturated colors, rich detail, single subject on plain white paper',
   neighbours: 0.35,
-  lang: '', llm: true, master: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
+  lang: '', llm: true, master: '', analysis: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, joinWindow: 2000, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
-const SETTINGS_V = 5;
+const SETTINGS_V = 6;
 const OLD_EXTRA = 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork';
 function loadSettings(){
   try {
@@ -209,6 +211,7 @@ function loadSettings(){
     if ((saved.v || 1) < 3 && saved.extra === OLD_EXTRA) delete saved.extra;   // old default invited whole scenes
     if ((saved.v || 1) < 4 && saved.engine === 'controlnet') delete saved.engine;  // was only ever the default
     if ((saved.v || 1) < 5 && saved.fillStrength === 0.8) delete saved.fillStrength;
+    if ((saved.v || 1) < 6 && /^You (write the prompt for|turn what an artist says)/.test(saved.master || '')) delete saved.master;  // an old default saved as text
     return Object.assign({}, DEFAULTS, saved, { v: SETTINGS_V });
   }
   catch { return Object.assign({}, DEFAULTS, { v: SETTINGS_V }); }
@@ -239,7 +242,7 @@ let current = null;
 let seenPen = false;
 let showLines = true;
 let scale = 1;
-const speech = { on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
+const speech = { brief: '', briefing: null, briefAgain: false, briefT: 0, on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
 
 // ---------- layout ----------
 function layout(){
@@ -509,15 +512,21 @@ function buildPrompt(subject){
 
 // ---------- speech ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const MASTER_DEFAULT = 'You write the prompt for an image model that paints ONE pencil sketch on a shared drawing board, while the artist talks. ' +
-  'Only the sketch itself gets painted; the rest of the board is already done, so never ask for a scene, a background, other objects or more of anything. ' +
-  'From what was said while drawing this sketch, name the single thing it shows and its look (colour, material, pose). ' +
-  'From what was said about the whole picture, take only style, palette, lighting and mood, never extra objects. ' +
-  'The speech can be in any language, rambling and full of filler; ignore anything not about the picture. ' +
+const MASTER_DEFAULT = 'You write the prompt for an image model that paints one sketch on a shared drawing board. ' +
+  'The artist thinks aloud while drawing: most of what they say is commentary, plans and instructions, not a description to copy. ' +
+  'Use the brief and the speech to understand what THIS sketch is meant to be, then describe only what should be visible in it. ' +
+  'A sketch can be one thing or a group drawn as one shape (for example a still life of several different fruits); then name each member. ' +
+  'Only the sketch gets painted and the rest of the board is done, so never add a background, a scene or objects that are not part of the sketch. ' +
+  'Take style, medium, lighting and mood from the brief. ' +
   'Never mention children, kids, babies or anyone\'s age, nor nudity or bodies; say "naive drawing style" instead of "children\'s drawing". ' +
   'Describe the finished painted object, not the drawing: never use the words sketch, drawing, pencil, outline or line art. ' +
-  'Answer in English with exactly two lines. Line 1: the prompt only, at most 20 words, comma-separated, no quotes; if nothing describable was said: simple colorful drawing. ' +
-  'Line 2: the main colour of that thing as a hex code, for example #d23a2a for a red apple or #f2d24b for a banana.';
+  'Answer in English with exactly two lines. Line 1: the prompt only, at most 25 words, comma-separated, no quotes; if nothing is known: simple colorful object. ' +
+  'Line 2: the main colour of each thing as hex codes separated by spaces, one per object, at most 5, for example #d23a2a for a red apple, or #d23a2a #f2d24b #6b2d7a for an apple, a banana and grapes.';
+const ANALYSIS_DEFAULT = 'You follow an artist who thinks aloud while drawing on a digital board, where an image model paints each sketch. ' +
+  'Keep a short working brief of what the artist is making, from everything said so far: the overall picture or theme (for example a still life of mixed fruit on a table), ' +
+  'the style and medium asked for, the objects already drawn or planned with their colours, and standing instructions (for example make everything brighter). ' +
+  'The speech can be in any language, rambling and full of filler; drop anything unrelated to the picture. Update the previous brief with the new speech; newer statements win. ' +
+  'Answer in English with the brief only, at most 80 words.';
 
 function startListening(){
   if (!SR){ toast('Speech recognition is not available in this browser. Use Safari or Chrome.'); return; }
@@ -572,6 +581,7 @@ function addSpeech(text, ts){
   const seg = { t: ts, text, regionId: null };
   speech.log.push(seg);
   if (speech.log.length > 300) speech.log.shift();
+  scheduleBrief();
   const best = sketchAt(ts, now);
   if (!best) return;
   seg.regionId = best.id;
@@ -599,9 +609,9 @@ function heardFor(r){
     parts.push(speech.interim);                                            // Safari can hold the last words as interim
   return parts.join(' ').trim();
 }
-function sceneText(){
+function sceneText(n = 80){
   const words = speech.log.map(seg => seg.text).join(' ').split(/\s+/).filter(Boolean);
-  return words.slice(-80).join(' ');
+  return words.slice(-n).join(' ');
 }
 
 let captionT = null;
@@ -623,14 +633,16 @@ async function describe(r, signal){
   r.heard = heardFor(r);
   const typed = /[\p{L}\p{N}]/u.test(r.prompt) ? r.prompt.trim() : '';   // a stray "." does not override speech
   const said = typed || r.heard;
-  const scene = sceneText();
   if (!S.llm) return said;
-  if (!said && !scene) return '';
-  const key = said + '|' + scene + '|' + S.master;
+  if (speech.log.some(seg => !seg.briefed) || speech.briefing)            // bring the brief up to date, but wait 2.5 s at most
+    await Promise.race([updateBrief(), new Promise(res => setTimeout(res, 2500))]);
+  const brief = speech.brief, recent = sceneText(40);
+  if (!said && !brief && !recent) return '';
+  const key = [said, brief, recent, S.master].join('|');
   if (r.llmKey !== key){
     try {
-      const o = await speechToPrompt(said, scene, signal);
-      r.llmKey = key; r.llmPrompt = o.prompt; r.color = o.color;
+      const o = await speechToPrompt(said, brief, recent, signal);
+      r.llmKey = key; r.llmPrompt = o.prompt; r.colors = o.colors;
     } catch (e){
       if (signal.aborted) throw e;
       if (!speech.llmWarned){ speech.llmWarned = true; toast('Speech-to-prompt failed, using your words as they are. ' + (e.message || e)); }
@@ -639,26 +651,54 @@ async function describe(r, signal){
   }
   return r.llmPrompt || said;
 }
-async function speechToPrompt(heard, scene, signal){
+async function llm(system, prompt, signal, ms){
   const ac = new AbortController();
   const stop = () => ac.abort();
   signal.addEventListener('abort', stop);
-  const timer = setTimeout(stop, 6000);                                     // never hold up the painting for long
+  const timer = setTimeout(stop, ms);                                       // never hold up the painting for long
   try {
     const res = await safeFetch('https://fal.run/' + S.llmEndpoint.trim(), {
       method: 'POST', signal: ac.signal,
       headers: { 'Authorization': 'Key ' + S.key.trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: S.llmModel.trim(), system_prompt: S.master.trim() || MASTER_DEFAULT,
-        prompt: 'Said while drawing this sketch: "' + (heard || '(nothing)') + '"\nSaid recently about the whole picture: "' + (scene || '(nothing)') + '"' })
+      body: JSON.stringify({ model: S.llmModel.trim(), system_prompt: system, prompt })
     });
     if (!res.ok){ let t = ''; try { t = await res.text(); } catch {} throw new Error('LLM ' + res.status + ': ' + t.slice(0, 200)); }
     const j = await res.json();
-    const text = String(j.output || '');
-    const out = text.split('\n').map(l => l.trim()).find(l => l && !/^(line \d:?\s*)?#[0-9a-f]{6}\b/i.test(l)) || '';
-    if (!out) throw new Error('LLM returned no text.');
-    const hex = text.match(/#[0-9a-f]{6}\b/i);
-    return { prompt: out.replace(/^line 1:\s*/i, '').replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300), color: hex ? hex[0] : '' };
+    return String(j.output || '');
   } finally { clearTimeout(timer); signal.removeEventListener('abort', stop); }
+}
+async function speechToPrompt(said, brief, recent, signal){
+  const text = await llm(S.master.trim() || MASTER_DEFAULT,
+    'Brief of what the artist is making: "' + (brief || '(none yet)') + '"\n' +
+    'Said while drawing this sketch: "' + (said || '(nothing)') + '"\n' +
+    'Most recent speech: "' + (recent || '(nothing)') + '"', signal, 6000);
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const out = lines.find(l => !/^(line \d:?\s*)?#[0-9a-f]{6}\b/i.test(l)) || '';
+  if (!out) throw new Error('LLM returned no text.');
+  const colors = lines.filter(l => l !== out).join(' ').match(/#[0-9a-f]{6}\b/gi) || [];
+  return { prompt: out.replace(/^line 1:\s*/i, '').replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300), colors: colors.slice(0, 5) };
+}
+
+// the running brief: what you are making overall, rebuilt from new speech in the background
+function scheduleBrief(){ clearTimeout(speech.briefT); speech.briefT = setTimeout(updateBrief, 1200); }
+async function updateBrief(){
+  clearTimeout(speech.briefT);
+  if (!S.llm || !S.key) return;
+  if (speech.briefing){ speech.briefAgain = true; return speech.briefing; }
+  const fresh = speech.log.filter(seg => !seg.briefed);
+  if (!fresh.length) return;
+  fresh.forEach(seg => seg.briefed = true);
+  speech.briefing = (async () => {
+    try {
+      const text = await llm(S.analysis.trim() || ANALYSIS_DEFAULT,
+        'Previous brief: "' + (speech.brief || '(none yet)') + '"\nNew speech: "' + fresh.map(seg => seg.text).join(' ') + '"',
+        new AbortController().signal, 8000);
+      if (text.trim()) speech.brief = text.trim().slice(0, 800);
+    } catch { fresh.forEach(seg => seg.briefed = false); }
+  })();
+  await speech.briefing;
+  speech.briefing = null;
+  if (speech.briefAgain){ speech.briefAgain = false; updateBrief(); }
 }
 
 // the sketch's shape in crop coordinates (n x n): everything enclosed by its strokes, plus the strokes.
@@ -735,11 +775,27 @@ function snapshot(r){
     const t = document.createElement('canvas'); t.width = t.height = 256;
     const tx = t.getContext('2d');
     tx.drawImage(shape, 0, 0);
-    const base = r.color || S.fillTone, k = 256 / s;               // shaded like a lit object: light top-left, dark bottom-right
+    const cols = r.colors && r.colors.length ? r.colors : [S.fillTone], k = 256 / s;
     const bx0 = (b.x0 - x) * k, by0 = (b.y0 - y) * k, bx1 = (b.x1 - x) * k, by1 = (b.y1 - y) * k;
-    const g = tx.createLinearGradient(bx0, by0, bx1, by1);
+    const paint = document.createElement('canvas'); paint.width = paint.height = 256;
+    const px = paint.getContext('2d');
+    if (cols.length > 1){                                      // a group (still life): soft patches of each colour
+      px.fillStyle = cols[0]; px.fillRect(0, 0, 256, 256);
+      const rad = Math.max(bx1 - bx0, by1 - by0) / 5;
+      for (let i = 0; i < cols.length * 6; i++){
+        px.fillStyle = cols[i % cols.length]; px.beginPath();
+        px.arc(bx0 + Math.random() * (bx1 - bx0), by0 + Math.random() * (by1 - by0), rad * (0.6 + Math.random() * 0.6), 0, Math.PI * 2); px.fill();
+      }
+      const blur = document.createElement('canvas'); blur.width = blur.height = 24;
+      blur.getContext('2d').drawImage(paint, 0, 0, 24, 24);
+      px.imageSmoothingEnabled = true; px.imageSmoothingQuality = 'high'; px.drawImage(blur, 0, 0, 256, 256);
+    }
+    const base = cols.length > 1 ? '#808080' : cols[0];      // shaded like a lit object: light top-left, dark bottom-right
+    const g = px.createLinearGradient(bx0, by0, bx1, by1);
     g.addColorStop(0, mix(base, '#ffffff', 0.35)); g.addColorStop(0.5, base); g.addColorStop(1, mix(base, '#000000', 0.3));
-    tx.globalCompositeOperation = 'source-in'; tx.fillStyle = g; tx.fillRect(0, 0, 256, 256);
+    if (cols.length > 1){ px.globalAlpha = 0.35; px.globalCompositeOperation = 'overlay'; }
+    px.fillStyle = g; px.fillRect(0, 0, 256, 256);
+    tx.globalCompositeOperation = 'source-in'; tx.drawImage(paint, 0, 0);
     sx.imageSmoothingEnabled = true; sx.imageSmoothingQuality = 'high';
     sx.drawImage(t, 0, 0, GEN, GEN);
   }
@@ -927,7 +983,8 @@ function openRegion(r){
   if (r.status === 'error') info.push(r.err);
   const heard = heardFor(r);
   if (heard) info.push('Heard: “' + heard + '”.');
-  if (r.lastPrompt) info.push('Prompt: ' + r.lastPrompt + (r.color ? ' (colour ' + r.color + ')' : '') + '.');
+  if (speech.brief) info.push('Brief: ' + speech.brief);
+  if (r.lastPrompt) info.push('Prompt: ' + r.lastPrompt + (r.colors && r.colors.length ? ' (colours ' + r.colors.join(' ') + ')' : '') + '.');
   if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
   $('rsInfo').textContent = info.join(' ');
   $('rsRevert').disabled = !hasResult(r.id);
@@ -993,6 +1050,7 @@ function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
   $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety;
   $('sMaster').value = S.master.trim() || MASTER_DEFAULT;
+  $('sAnalysis').value = S.analysis.trim() || ANALYSIS_DEFAULT;
   $('settingsSheet').classList.add('open');
 }
 $('btnSettings').onclick = openSettings;
@@ -1000,6 +1058,8 @@ $('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
 $('sSave').onclick = () => {
   for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
   S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked; S.safety = $('sSafety').checked;
+  const analysis = $('sAnalysis').value.trim();
+  S.analysis = analysis === ANALYSIS_DEFAULT ? '' : analysis;
   const master = $('sMaster').value.trim();
   S.master = master === MASTER_DEFAULT ? '' : master;
   if (speech.on){ stopListening(); startListening(); }                    // pick up a new language

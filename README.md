@@ -15,5 +15,7 @@ Tap **Listen** and talk about what you draw. The browser's speech recognition (S
 
 - Words said while a sketch is being drawn, or up to 8 s before it starts, belong to that sketch. Words said within 6 s after its last stroke repaint it.
 - If you are mid-sentence when the pen stops, painting waits (up to 5 s) for the sentence to end.
-- Before painting, an LLM on fal.ai (`fal-ai/any-llm`, model set in Settings) turns the sketch's words plus the recent talk about the whole picture into a short English prompt, so you can speak any language. If that call fails, your words are used as they are.
+- Your talk is treated as commentary, not as the prompt. In the background an LLM on fal.ai (`fal-ai/any-llm`, model set in Settings) keeps a short **brief** of what you are making overall (theme, style, objects, standing instructions).
+- When a sketch is painted, a second LLM step reads the brief plus what you said while drawing it and writes a visual description of just that sketch, plus one colour per object. A sketch may be a group (a still life of several fruits); its fill then starts from patches of those colours. You can speak any language; if the LLM fails, your words are used as they are.
+- Both instructions (analysis prompt and master prompt) are editable in Settings.
 - A sketch's typed "What is it?" text overrides speech. Tap a sketch's chip to see what was heard and the prompt that was used.
