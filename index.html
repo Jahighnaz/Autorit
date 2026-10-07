@@ -67,6 +67,11 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .panel .grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
 .panel p.note{font-size:13px;color:var(--muted);margin:6px 0 0}
 .check{display:flex!important;gap:8px;align-items:center;color:var(--ink)!important;font-size:15px!important}
+#caption{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);max-width:min(90%,720px);
+  background:rgba(34,48,42,.88);color:#fff;border-radius:10px;padding:6px 12px;font-size:14px;line-height:1.35;
+  pointer-events:none;opacity:0;transition:opacity .3s;z-index:2}
+#caption.show{opacity:1}
+#caption em{opacity:.7}
 #toast{position:fixed;left:50%;bottom:calc(16px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);
   background:#22302A;color:#fff;padding:10px 14px;border-radius:10px;font-size:14px;max-width:90%;
   opacity:0;pointer-events:none;transition:opacity .2s}
@@ -77,6 +82,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 <header>
   <h1>Sketchboard</h1>
   <input id="style" type="text" placeholder="Style for the whole board, e.g. watercolor, warm evening light" aria-label="Board style">
+  <button id="btnMic" aria-pressed="false" title="Listen while you draw; what you say steers the painting">Listen</button>
   <button id="btnGen" class="primary" title="Paint every unfinished sketch now">Paint now</button>
   <button id="btnUndo" title="Remove the last stroke">Undo</button>
   <button id="btnSketch" aria-pressed="true" title="Show or hide sketch lines over painted areas">Lines</button>
@@ -89,14 +95,15 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div id="board">
     <canvas id="gen"></canvas>
     <canvas id="ink"></canvas>
-    <div id="hint">Draw with Apple Pencil.<br>When you move on to another spot, the sketch gets painted.</div>
+    <div id="hint">Draw with Apple Pencil.<br>When you move on to another spot, the sketch gets painted.<br>Tap Listen and talk about what you draw.</div>
   </div>
+  <div id="caption" aria-live="polite"></div>
 </div>
 
 <div class="sheet" id="regionSheet">
   <div class="panel" role="dialog" aria-labelledby="rsTitle">
     <h2 id="rsTitle">This sketch</h2>
-    <label for="rsPrompt">What is it? (optional, improves results)</label>
+    <label for="rsPrompt">What is it? (optional; overrides what you said)</label>
     <input id="rsPrompt" type="text" placeholder="e.g. a lighthouse on a cliff">
     <div class="row">
       <button id="rsPaint" class="primary">Paint again</button>
@@ -129,6 +136,13 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     <label for="sExtra">Always add to the prompt</label>
     <input id="sExtra" type="text">
     <p class="note">Pushes the model to paint the whole picture in colour rather than return the pencil lines. Clear it to turn this off.</p>
+    <label for="sLang">Speech language (empty = this device's language)</label>
+    <input id="sLang" type="text" placeholder="e.g. sv-SE or en-US">
+    <label class="check"><input id="sLlm" type="checkbox"> Turn speech into an English prompt with an LLM (via fal.ai)</label>
+    <div class="grid">
+      <div><label for="sLlmEp">LLM endpoint</label><input id="sLlmEp" type="text"></div>
+      <div><label for="sLlmModel">LLM model</label><input id="sLlmModel" type="text"></div>
+    </div>
     <label class="check"><input id="sRefine" type="checkbox"> Refine after the first preview</label>
     <label class="check"><input id="sPen" type="checkbox"> Only Apple Pencil draws (fingers tap)</label>
     <div class="row">
@@ -155,6 +169,7 @@ const DEFAULTS = {
   refine: true,
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
   extra: 'fully painted, vivid saturated colors, colored shapes, rich detail, finished artwork',
+  lang: '', llm: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
 const SETTINGS_V = 2;
@@ -191,6 +206,7 @@ let current = null;
 let seenPen = false;
 let showLines = true;
 let scale = 1;
+const speech = { on: false, rec: null, log: [], interim: '', interimAt: 0, llmWarned: false };   // log: {t, text, regionId}
 
 // ---------- layout ----------
 function layout(){
@@ -286,8 +302,9 @@ function addStroke(st){
   const hits = regions.filter(r => intersects(r.bbox, box, MERGE_MARGIN));
   let r;
   if (!hits.length){
-    r = { id: nextId++, strokes: [], bbox: box, version: 0, lastTouched: 0, status: 'waiting', prompt: '', err: '', abort: null, timer: null, chip: null };
+    r = { id: nextId++, strokes: [], bbox: box, version: 0, lastTouched: 0, lastStroke: 0, status: 'waiting', prompt: '', err: '', abort: null, timer: null, chip: null };
     regions.push(r); makeChip(r);
+    claimRecentSpeech(r);
   } else {
     r = hits[0];
     for (const o of hits.slice(1)){            // merge neighbours into one sketch
@@ -297,11 +314,13 @@ function addStroke(st){
       o.strokes.forEach(s => s.regionId = r.id);
       results.forEach(res => { if (res.regionId === o.id) res.regionId = r.id; });
       if (o.prompt && !r.prompt) r.prompt = o.prompt;
+      speech.log.forEach(seg => { if (seg.regionId === o.id) seg.regionId = r.id; });
       removeRegion(o, false);
     }
   }
   st.regionId = r.id;
   r.strokes.push(st);
+  r.lastStroke = performance.now();
   recomputeBox(r);
   touch(r);
   strokeOrder.push(st);
@@ -314,7 +333,14 @@ function touch(r){
   queue = queue.filter(q => q !== r);
   setStatus(r, 'waiting');
   clearTimeout(r.timer);
-  r.timer = setTimeout(() => enqueue(r), S.dwell);
+  r.timer = setTimeout(() => dwellDone(r), S.dwell);
+}
+// if you are mid-sentence when the pen stops, wait (a little) for the sentence to end
+function dwellDone(r, held = 0){
+  if (speech.on && speech.interim && performance.now() - speech.interimAt < 1500 && held < 5000){
+    r.timer = setTimeout(() => dwellDone(r, held + 400), 400); return;
+  }
+  enqueue(r);
 }
 
 function removeRegion(r, dropResults = true){
@@ -416,9 +442,137 @@ function pump(){
   }
 }
 
-function buildPrompt(r){
-  const subject = r.prompt.trim() || 'colorful illustration, clean composition';
-  return [subject, S.style.trim(), String(S.extra || '').trim()].filter(Boolean).join(', ');
+function buildPrompt(subject){
+  return [subject || 'colorful illustration, clean composition', S.style.trim(), String(S.extra || '').trim()].filter(Boolean).join(', ');
+}
+
+// ---------- speech ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const LLM_SYSTEM = 'You turn what an artist says out loud while sketching into a short English prompt for an image model (Stable Diffusion XL). ' +
+  'The speech can be in any language, rambling, and full of filler words. Describe what this sketch depicts, adding setting, colours, ' +
+  'lighting and mood from the speech about the whole picture when they fit. Ignore talk that is not about the picture. ' +
+  'Answer with the prompt only: at most 30 words, comma-separated phrases, no quotes. If nothing describable was said, answer: colorful illustration';
+
+function startListening(){
+  if (!SR){ toast('Speech recognition is not available in this browser. Use Safari or Chrome.'); return; }
+  speech.on = true; updateMic(); startRec();
+}
+function stopListening(){
+  speech.on = false; speech.interim = '';
+  if (speech.rec) try { speech.rec.stop(); } catch {}
+  updateMic(); showCaption();
+}
+function startRec(){
+  const rec = new SR(); speech.rec = rec;
+  rec.lang = S.lang.trim() || navigator.language || 'en-US';
+  rec.continuous = true; rec.interimResults = true;
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++){
+      const res = e.results[i];
+      if (res.isFinal) addSpeech(res[0].transcript); else interim += res[0].transcript;
+    }
+    speech.interim = interim.trim();
+    if (speech.interim) speech.interimAt = performance.now();
+    showCaption();
+  };
+  rec.onerror = e => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed'){
+      toast('Microphone or speech recognition was not allowed. Check the browser\'s settings for this site.');
+      stopListening();
+    }
+  };
+  rec.onend = () => {                       // Safari ends the session after pauses: keep it going
+    if (speech.rec === rec) speech.rec = null;
+    if (speech.on) setTimeout(() => { if (speech.on && !speech.rec) startRec(); }, 250);
+  };
+  try { rec.start(); } catch (e){ toast('Could not start listening: ' + e.message); stopListening(); }
+}
+function updateMic(){
+  $('btnMic').setAttribute('aria-pressed', String(speech.on));
+  $('btnMic').textContent = speech.on ? 'Listening' : 'Listen';
+}
+
+// words go to the sketch being drawn; if none, to one whose last stroke was a moment ago (it repaints),
+// otherwise they wait a few seconds for the next sketch to start
+function addSpeech(text){
+  text = text.trim(); if (!text) return;
+  const now = performance.now();
+  const last = speech.log[speech.log.length - 1];
+  if (last && last.text === text && now - last.t < 3000) return;          // Safari sometimes repeats a final result
+  const seg = { t: now, text, regionId: null };
+  speech.log.push(seg);
+  if (speech.log.length > 300) speech.log.shift();
+  const newest = list => list.sort((a, b) => b.lastStroke - a.lastStroke)[0];
+  const active = newest(regions.filter(r => r.status === 'waiting'));
+  const r = active || newest(regions.filter(r => now - r.lastStroke < 6000));
+  if (!r) return;
+  seg.regionId = r.id;
+  if (!active && r.status !== 'queued') touch(r);                          // already painting: paint again with the new words
+}
+function claimRecentSpeech(r){
+  const now = performance.now();
+  for (const seg of speech.log) if (seg.regionId === null && now - seg.t < 8000) seg.regionId = r.id;
+}
+function heardFor(r){
+  const parts = speech.log.filter(seg => seg.regionId === r.id).map(seg => seg.text);
+  const newest = regions.reduce((a, b) => (!a || b.lastStroke > a.lastStroke) ? b : a, null);
+  if (speech.interim && newest === r) parts.push(speech.interim);         // Safari can hold the last words as interim
+  return parts.join(' ').trim();
+}
+function sceneText(){
+  const words = speech.log.map(seg => seg.text).join(' ').split(/\s+/).filter(Boolean);
+  return words.slice(-80).join(' ');
+}
+
+let captionT = null;
+function showCaption(){
+  const c = $('caption');
+  const last = speech.log[speech.log.length - 1];
+  if (!speech.on || (!speech.interim && !last)){ c.classList.remove('show'); return; }
+  c.innerHTML = '';
+  if (last && performance.now() - last.t < 8000) c.append(last.text + ' ');
+  if (speech.interim){ const em = document.createElement('em'); em.textContent = speech.interim; c.append(em); }
+  c.classList.toggle('show', !!c.textContent.trim());
+  clearTimeout(captionT); captionT = setTimeout(() => { if (!speech.interim) c.classList.remove('show'); }, 6000);
+}
+
+// what to paint: typed text wins, then what was said (cleaned up by the LLM), else nothing
+async function describe(r, signal){
+  r.heard = heardFor(r);
+  if (r.prompt.trim()) return r.prompt.trim();
+  const scene = sceneText();
+  if (!S.llm) return r.heard;
+  if (!r.heard && !scene) return '';
+  const key = r.heard + '|' + scene;
+  if (r.llmKey === key) return r.llmPrompt;
+  try {
+    const p = await speechToPrompt(r.heard, scene, signal);
+    r.llmKey = key; r.llmPrompt = p; return p;
+  } catch (e){
+    if (signal.aborted) throw e;
+    if (!speech.llmWarned){ speech.llmWarned = true; toast('Speech-to-prompt failed, using your words as they are. ' + (e.message || e)); }
+    return r.heard;
+  }
+}
+async function speechToPrompt(heard, scene, signal){
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  signal.addEventListener('abort', stop);
+  const timer = setTimeout(stop, 6000);                                     // never hold up the painting for long
+  try {
+    const res = await safeFetch('https://fal.run/' + S.llmEndpoint.trim(), {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Authorization': 'Key ' + S.key.trim(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: S.llmModel.trim(), system_prompt: LLM_SYSTEM,
+        prompt: 'Said while drawing this sketch: "' + (heard || '(nothing)') + '"\nSaid recently about the whole picture: "' + (scene || '(nothing)') + '"' })
+    });
+    if (!res.ok){ let t = ''; try { t = await res.text(); } catch {} throw new Error('LLM ' + res.status + ': ' + t.slice(0, 200)); }
+    const j = await res.json();
+    const out = String(j.output || '').split('\n').map(l => l.trim()).find(Boolean) || '';
+    if (!out) throw new Error('LLM returned no text.');
+    return out.replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 300);
+  } finally { clearTimeout(timer); signal.removeEventListener('abort', stop); }
 }
 
 function snapshot(r){
@@ -554,12 +708,15 @@ async function runJob(r){
   if (r.abort) r.abort.abort();
   const ac = new AbortController(); r.abort = ac;
   const snap = snapshot(r);
-  const prompt = buildPrompt(r);
+  let prompt = '';
   const seed = Math.floor(Math.random() * 2147483647);
   const slot = {};
   const t0 = performance.now();
   try {
     setStatus(r, 'preview');
+    prompt = buildPrompt(await describe(r, ac.signal));
+    r.lastPrompt = prompt;
+    if (r.version !== version || !regions.includes(r)) return;
     const a = await generateSafe(S.previewModel, S.previewSteps, snap.url, prompt, seed, ac.signal);
     if (r.version !== version || !regions.includes(r)) return;     // sketch changed meanwhile: drop stale result
     applyResult(r, a.bmp, snap, slot);
@@ -593,6 +750,9 @@ function openRegion(r){
   $('rsPrompt').value = r.prompt;
   const info = [];
   if (r.status === 'error') info.push(r.err);
+  const heard = heardFor(r);
+  if (heard) info.push('Heard: “' + heard + '”.');
+  if (r.lastPrompt) info.push('Prompt: ' + r.lastPrompt + '.');
   if (r.timing) info.push('Preview took ' + (r.timing/1000).toFixed(1) + ' s' + (r.timingTotal ? ', finished after ' + (r.timingTotal/1000).toFixed(1) + ' s' : '') + '.');
   $('rsInfo').textContent = info.join(' ');
   $('rsRevert').disabled = !hasResult(r.id);
@@ -617,6 +777,7 @@ $('regionSheet').addEventListener('click', e => { if (e.target.id === 'regionShe
 // ---------- toolbar ----------
 $('style').value = S.style;
 $('style').addEventListener('change', () => { S.style = $('style').value; saveSettings(); });
+$('btnMic').onclick = () => speech.on ? stopListening() : startListening();
 $('btnGen').onclick = () => regions.filter(r => r.status === 'waiting' || r.status === 'error').forEach(enqueue);
 $('btnUndo').onclick = () => {
   const st = strokeOrder.pop(); if (!st) return;
@@ -647,18 +808,19 @@ $('btnExport').onclick = () => {
 };
 
 // ---------- settings sheet ----------
-const FIELDS = [['sKey','key'],['sExtra','extra'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
+const FIELDS = [['sKey','key'],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sLeave','leave',Number],['sCtx','context',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
-  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly;
+  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm;
   $('settingsSheet').classList.add('open');
 }
 $('btnSettings').onclick = openSettings;
 $('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
 $('sSave').onclick = () => {
   for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
-  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked;
+  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked;
+  if (speech.on){ stopListening(); startListening(); }                    // pick up a new language
   saveSettings(); $('settingsSheet').classList.remove('open'); toast('Settings saved.');
 };
 
