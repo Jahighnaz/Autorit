@@ -177,6 +177,8 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     </div>
     <label for="sAnalysis">Analysis prompt: how your talk becomes the running brief</label>
     <textarea id="sAnalysis" rows="5"></textarea>
+    <label class="check"><input id="sVision" type="checkbox"> Let the LLM look at each sketch (vision endpoint)</label>
+    <label for="sVisionEp">LLM vision endpoint</label><input id="sVisionEp" type="text">
     <label for="sMaster">Master prompt: how the brief and a sketch's words become its image prompt</label>
     <textarea id="sMaster" rows="6"></textarea>
     <p class="note">Sent to the LLM with every sketch's words. Clear it to restore the default.</p>
@@ -198,7 +200,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b15 live mode';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b16 llm sees sketch';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -214,7 +216,7 @@ const DEFAULTS = {
   neighbours: 0.35,
   mode: 'sketch', liveModel: 'fal-ai/fast-lightning-sdxl/image-to-image', liveSteps: '2', liveFps: 3,
   finalModel: 'fal-ai/flux-kontext/dev',
-  adapt: true, lang: '', llm: true, master: '', analysis: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
+  adapt: true, lang: '', llm: true, master: '', analysis: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmVision: true, llmVisionEndpoint: 'fal-ai/any-llm/vision', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, joinWindow: 2000, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
 const SETTINGS_V = 6;
@@ -265,7 +267,7 @@ let current = null;
 let seenPen = false;
 let showLines = true;
 let scale = 1;
-const speech = { editWarned: false, brief: '', briefing: null, briefAgain: false, briefT: 0, on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
+const speech = { visionOff: false, editWarned: false, brief: '', briefing: null, briefAgain: false, briefT: 0, on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
 
 // ---------- layout ----------
 function layout(){
@@ -542,6 +544,8 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const MASTER_DEFAULT = 'You write the prompt for an image model that paints one sketch on a shared drawing board. ' +
   'The artist thinks aloud while drawing: most of what they say is commentary, plans and instructions, not a description to copy. ' +
   'Use the brief and the speech to understand what THIS sketch is meant to be, then describe only what should be visible in it. ' +
+  'What was said while drawing this sketch, and its shape (you may also see it as an image), decide what it is; the brief describes the whole session, ' +
+  'so take an object from the brief only if it clearly matches this shape and nothing was said about this sketch. Follow the drawn shape: a bottle outline stays a bottle. ' +
   'A sketch can be one thing or a group drawn as one shape (for example a still life of several different fruits); then name each member. ' +
   'Only the sketch gets painted and the rest of the board is done, so never add a background, a scene or objects that are not part of the sketch. ' +
   'Take style, medium, lighting and mood from the brief. ' +
@@ -567,6 +571,7 @@ const ANALYSIS_DEFAULT = 'You follow an artist who thinks aloud while drawing on
   'Keep a short working brief of what the artist is making, from everything said so far: the overall picture or theme (for example a still life of mixed fruit on a table), ' +
   'the style and medium asked for, the objects already drawn or planned with their colours, and standing instructions (for example make everything brighter). ' +
   'The speech can be in any language, rambling and full of filler; drop anything unrelated to the picture. Update the previous brief with the new speech; newer statements win. ' +
+  'Keep separate objects separate: list each one on its own with its own attributes, and never merge the attributes of different objects. ' +
   'Answer in English with the brief only, at most 80 words.';
 
 function startListening(){
@@ -678,11 +683,10 @@ async function describe(r, signal){
   if (speech.log.some(seg => !seg.briefed) || speech.briefing)            // bring the brief up to date, but wait 2.5 s at most
     await Promise.race([updateBrief(), new Promise(res => setTimeout(res, 2500))]);
   const brief = speech.brief, recent = sceneText(40);
-  if (!said && !brief && !recent) return '';
-  const key = [said, brief, recent, S.master].join('|');
+  const key = [said, brief, recent, S.master, r.strokes.reduce((n, st) => n + st.pts.length, 0)].join('|');
   if (r.llmKey !== key){
     try {
-      const o = await speechToPrompt(said, brief, recent, signal);
+      const o = await speechToPrompt(r, said, brief, recent, signal);
       r.llmKey = key; r.llmPrompt = o.prompt; r.colors = o.colors; r.type = o.type;
     } catch (e){
       if (signal.aborted) throw e;
@@ -692,27 +696,65 @@ async function describe(r, signal){
   }
   return r.llmPrompt || said;
 }
-async function llm(system, prompt, signal, ms){
+// the sketch alone, black on white, for the LLM to look at
+function sketchImage(r){
+  const b = r.bbox, pad = 24, side = Math.max(b.x1 - b.x0, b.y1 - b.y0) + 2 * pad, n = 384;
+  const c = document.createElement('canvas'); c.width = c.height = n;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, n, n);
+  cx.save(); cx.scale(n / side, n / side);
+  cx.translate(-(b.x0 + b.x1 - side) / 2, -(b.y0 + b.y1 - side) / 2);
+  for (const st of r.strokes) drawStroke(cx, st, '#111');
+  cx.restore();
+  return c.toDataURL('image/jpeg', 0.85);
+}
+function shapeWords(r){
+  const b = r.bbox, w = b.x1 - b.x0, h = b.y1 - b.y0;
+  const form = h > w * 1.4 ? 'tall and narrow (' + (h / w).toFixed(1) + ' times as high as wide)'
+    : w > h * 1.4 ? 'wide and low (' + (w / h).toFixed(1) + ' times as wide as high)' : 'about as wide as high';
+  const pad = 8, side = Math.max(w, h) + 2 * pad, n = 64;
+  const d = shapeOf(r, b.x0 - pad, b.y0 - pad, side, n).getContext('2d').getImageData(0, 0, n, n).data;
+  let inside = 0; for (let i = 3; i < d.length; i += 4) if (d[i] > 128) inside++;
+  const filled = inside / ((w / side) * (h / side) * n * n);
+  return form + ', ' + (filled > 0.35 ? 'a closed outline' : 'open lines');
+}
+
+async function llm(system, prompt, signal, ms, image){
+  if (image && S.llmVision && !speech.visionOff){
+    try { return await llmCall(S.llmVisionEndpoint, system, prompt, signal, ms, image); }
+    catch (e){
+      if (signal.aborted || !/^LLM 4\d\d/.test(e.message)) throw e;
+      speech.visionOff = true;                                     // endpoint or input not as expected: words only from now on
+      toast('The LLM could not look at the sketch (' + e.message.slice(0, 120) + '). Using words and shape only.');
+    }
+  }
+  return llmCall(S.llmEndpoint, system, prompt, signal, ms);
+}
+async function llmCall(endpoint, system, prompt, signal, ms, image){
   const ac = new AbortController();
   const stop = () => ac.abort();
   signal.addEventListener('abort', stop);
   const timer = setTimeout(stop, ms);                                       // never hold up the painting for long
   try {
-    const res = await safeFetch('https://fal.run/' + S.llmEndpoint.trim(), {
+    const body = { model: S.llmModel.trim(), system_prompt: system, prompt };
+    if (image) body.image_url = image;
+    const res = await safeFetch('https://fal.run/' + endpoint.trim(), {
       method: 'POST', signal: ac.signal,
       headers: { 'Authorization': 'Key ' + S.key.trim(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: S.llmModel.trim(), system_prompt: system, prompt })
+      body: JSON.stringify(body)
     });
     if (!res.ok){ let t = ''; try { t = await res.text(); } catch {} throw new Error('LLM ' + res.status + ': ' + t.slice(0, 200)); }
     const j = await res.json();
     return String(j.output || '');
   } finally { clearTimeout(timer); signal.removeEventListener('abort', stop); }
 }
-async function speechToPrompt(said, brief, recent, signal){
+async function speechToPrompt(r, said, brief, recent, signal){
   const text = await llm(S.master.trim() || MASTER_DEFAULT,
     'Brief of what the artist is making: "' + (brief || '(none yet)') + '"\n' +
     'Said while drawing this sketch: "' + (said || '(nothing)') + '"\n' +
-    'Most recent speech: "' + (recent || '(nothing)') + '"', signal, 6000);
+    'Most recent speech: "' + (recent || '(nothing)') + '"\n' +
+    'Shape of this sketch: ' + shapeWords(r) + ' (if an image is attached, it shows the sketch)',
+    signal, 8000, sketchImage(r));
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const out = lines.find(l => !/^(line \d:?\s*)?(#[0-9a-f]{6}\b|type\s*:)/i.test(l)) || '';
   const type = ((text.match(/type\s*:\s*\**\s*([a-z]+)/i) || [])[1] || '').toLowerCase();
@@ -1205,11 +1247,11 @@ $('btnExport').onclick = () => {
 };
 
 // ---------- settings sheet ----------
-const FIELDS = [['sKey','key'],['sLiveM','liveModel'],['sLiveFps','liveFps',Number],['sLiveS','liveSteps'],['sFinal','finalModel'],['sEngine','engine'],['sFillStr','fillStrength',Number],['sFillTone','fillTone'],['sFillBase','fillBase'],['sCnM','cnModel'],['sCnScale','cnScale',Number],['sCnPS','cnPreviewSteps',Number],['sCnS','cnSteps',Number],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
+const FIELDS = [['sKey','key'],['sVisionEp','llmVisionEndpoint'],['sLiveM','liveModel'],['sLiveFps','liveFps',Number],['sLiveS','liveSteps'],['sFinal','finalModel'],['sEngine','engine'],['sFillStr','fillStrength',Number],['sFillTone','fillTone'],['sFillBase','fillBase'],['sCnM','cnModel'],['sCnScale','cnScale',Number],['sCnPS','cnPreviewSteps',Number],['sCnS','cnSteps',Number],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sJoin','joinWindow',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
-  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety; $('sAdapt').checked = !!S.adapt;
+  $('sRefine').checked = !!S.refine; $('sPen').checked = !!S.penOnly; $('sLlm').checked = !!S.llm; $('sSafety').checked = !!S.safety; $('sAdapt').checked = !!S.adapt; $('sVision').checked = !!S.llmVision;
   $('sMaster').value = S.master.trim() || MASTER_DEFAULT;
   $('sAnalysis').value = S.analysis.trim() || ANALYSIS_DEFAULT;
   $('settingsSheet').classList.add('open');
@@ -1218,7 +1260,7 @@ $('btnSettings').onclick = openSettings;
 $('sCancel').onclick = () => $('settingsSheet').classList.remove('open');
 $('sSave').onclick = () => {
   for (const [id, k, conv] of FIELDS){ const v = $(id).value; S[k] = conv ? (isNaN(conv(v)) ? DEFAULTS[k] : conv(v)) : v; }
-  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked; S.safety = $('sSafety').checked; S.adapt = $('sAdapt').checked;
+  S.refine = $('sRefine').checked; S.penOnly = $('sPen').checked; S.llm = $('sLlm').checked; S.safety = $('sSafety').checked; S.adapt = $('sAdapt').checked; S.llmVision = $('sVision').checked; speech.visionOff = false;
   const analysis = $('sAnalysis').value.trim();
   S.analysis = analysis === ANALYSIS_DEFAULT ? '' : analysis;
   const master = $('sMaster').value.trim();
