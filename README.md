@@ -33,3 +33,7 @@ The prompt LLM also names what kind of sketch it is, and each kind is prepared a
 | creature | noise | 0.88 | 0.4 | coherent anatomy |
 
 The improvement pass repaints the first result lightly (inside the shape, lines faintly on top) instead of starting again from the sketch.
+
+## Live mode
+
+The **Sketch / Live** button switches modes. In Live mode the sketch you are drawing is sent to the fast model as a 512 px image while you draw (at most `Live frames per second`, newest state wins, one fixed seed per sketch), and each frame appears under your lines. When you pause, the final pass runs: by default an editing model (`fal-ai/flux-kontext/dev`) told to keep the shape and remove the lines; if fal rejects that request the fast model is used. Then the lines melt away. Every live frame is a paid request.

@@ -83,6 +83,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 <header>
   <h1>Sketchboard <small id="build"></small></h1>
   <input id="style" type="text" placeholder="Style for the whole board, e.g. watercolor, warm evening light" aria-label="Board style">
+  <button id="btnMode" title="Sketch: paint each sketch when you pause. Live: see the painting update while you draw.">Sketch</button>
   <button id="btnMic" aria-pressed="false" title="Listen while you draw; what you say steers the painting">Listen</button>
   <button id="btnGen" class="primary" title="Paint every unfinished sketch now">Paint now</button>
   <button id="btnUndo" title="Remove the last stroke">Undo</button>
@@ -123,6 +124,13 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
     <label for="sKey">fal.ai API key</label>
     <input id="sKey" type="password" placeholder="key-id:key-secret" autocomplete="off">
     <p class="note">Stored only in this browser. Anyone with access to this page in your browser can read it, so keep the page private.</p>
+    <div class="grid">
+      <div><label for="sLiveM">Live model</label><input id="sLiveM" type="text"></div>
+      <div><label for="sLiveFps">Live frames per second (max)</label><input id="sLiveFps" type="number" step="0.5" min="0.5" max="10"></div>
+      <div><label for="sLiveS">Live steps</label><input id="sLiveS" type="text"></div>
+      <div><label for="sFinal">Final pass model (empty = fast model)</label><input id="sFinal" type="text"></div>
+    </div>
+    <p class="note">The final pass runs after you pause. An editing model (FLUX Kontext, nano-banana) is told to keep your shape and remove the lines.</p>
     <label for="sEngine">Engine</label>
     <select id="sEngine">
       <option value="fill">Fill shapes: keeps your outline, paints inside it</option>
@@ -190,7 +198,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 'use strict';
 
 // ---------- constants & settings ----------
-const BUILD = 'b14 object types';     // bump on every change, so you can see which version the browser runs
+const BUILD = 'b15 live mode';     // bump on every change, so you can see which version the browser runs
 const W = 2048, H = 1536;          // board world size (4:3, matches iPad)
 const GEN = 1024;                  // size sent to the model
 const MERGE_MARGIN = 50;           // strokes this close to a sketch's box are checked for joining it
@@ -204,6 +212,8 @@ const DEFAULTS = {
   refineModel: 'fal-ai/fast-lightning-sdxl/image-to-image', refineSteps: '8',
   extra: 'fully painted, vivid saturated colors, rich detail, single subject on plain white paper',
   neighbours: 0.35,
+  mode: 'sketch', liveModel: 'fal-ai/fast-lightning-sdxl/image-to-image', liveSteps: '2', liveFps: 3,
+  finalModel: 'fal-ai/flux-kontext/dev',
   adapt: true, lang: '', llm: true, master: '', analysis: '', safety: true, llmEndpoint: 'fal-ai/any-llm', llmModel: 'google/gemini-2.5-flash',
   strength: 0.95, parallel: 2, dwell: 1800, joinWindow: 2000, leave: 120, context: 0.3, brush: 4, penOnly: true
 };
@@ -225,7 +235,7 @@ function saveSettings(){
   try { localStorage.setItem('sketchboard.settings', JSON.stringify(S)); } catch {}
 }
 const S = loadSettings();
-document.getElementById('build').textContent = BUILD + ' \u00b7 ' + S.engine;
+document.getElementById('build').textContent = BUILD + ' \u00b7 ' + S.engine + ' \u00b7 ' + S.mode;
 // is the server already on a newer build than this page? (tells a stale browser cache from a missing deploy)
 fetch(location.href.split('#')[0], { cache: 'no-store' }).then(res => res.text()).then(html => {
   const live = (html.match(/const BUILD = '([^']+)'/) || [])[1];
@@ -255,7 +265,7 @@ let current = null;
 let seenPen = false;
 let showLines = true;
 let scale = 1;
-const speech = { brief: '', briefing: null, briefAgain: false, briefT: 0, on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
+const speech = { editWarned: false, brief: '', briefing: null, briefAgain: false, briefT: 0, on: false, rec: null, log: [], interim: "", interimAt: 0, uttStart: 0, llmWarned: false, cnWarned: false };   // log: {t, text, regionId}
 
 // ---------- layout ----------
 function layout(){
@@ -303,14 +313,18 @@ function hasResult(id){ return results.some(r => r.regionId === id); }
 function redrawInk(){
   inkX.clearRect(0, 0, W, H);
   for (const r of regions){
-    const painted = hasResult(r.id);
-    const alpha = painted ? (showLines ? 0.18 : 0) : 1;
+    const painted = hasResult(r.id), rest = showLines ? 0.18 : 0;
+    let alpha = painted ? rest : 1;
+    if (S.mode === 'live' && painted){
+      if (r.status === 'waiting' || r.status === 'queued' || r.status === 'refining') alpha = 1;      // live result under your lines
+      else if (r.meltStart) alpha = rest + (1 - rest) * Math.max(0, 1 - (performance.now() - r.meltStart) / 1200);
+    }
     if (alpha > 0){
       inkX.globalAlpha = alpha;
       for (const st of r.strokes) drawStroke(inkX, st, '#111');
       inkX.globalAlpha = 1;
     }
-    if (['waiting','queued','preview','refining'].includes(r.status)){
+    if (['waiting','queued','preview','refining'].includes(r.status) && !(S.mode === 'live' && hasResult(r.id))){
       const b = r.bbox;
       inkX.save();
       inkX.setLineDash([10, 8]); inkX.lineWidth = 2; inkX.strokeStyle = 'rgba(47,75,216,.45)';
@@ -793,7 +807,7 @@ function mix(a, b, t){
   return '#' + ca.map((v, i) => Math.round(v + (cb[i] - v) * t).toString(16).padStart(2, '0')).join('');
 }
 
-function snapshot(r){
+function snapshot(r, G = GEN){
   const b = r.bbox;
   const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
   let s = Math.max(b.x1 - b.x0, b.y1 - b.y0) * (1 + 2 * S.context) + 40;
@@ -805,17 +819,17 @@ function snapshot(r){
   // image for the model: this sketch at full strength; neighbouring paintings and sketches faded,
   // so they set colour and style but are not read as things to draw again
   const fade = Math.min(Math.max(Number(S.neighbours), 0), 1);
-  const src = document.createElement('canvas'); src.width = src.height = GEN;
+  const src = document.createElement('canvas'); src.width = src.height = G;
   const sx = src.getContext('2d');
-  sx.fillStyle = '#fff'; sx.fillRect(0, 0, GEN, GEN);
+  sx.fillStyle = '#fff'; sx.fillRect(0, 0, G, G);
   sx.globalAlpha = fade;
-  sx.drawImage(others, x, y, s, s, 0, 0, GEN, GEN);
-  sx.save(); sx.scale(GEN / s, GEN / s); sx.translate(-x, -y);
-  for (const o of regions) if (o !== r && !hasResult(o.id)) for (const st of o.strokes) drawStroke(sx, st, '#111');
+  sx.drawImage(others, x, y, s, s, 0, 0, G, G);
+  sx.save(); sx.scale(G / s, G / s); sx.translate(-x, -y);
+  for (const o of regions) if (o.id !== r.id && !hasResult(o.id)) for (const st of o.strokes) drawStroke(sx, st, '#111');
   sx.restore();
   sx.globalAlpha = 1;                                         // after restore: the save above kept the faded alpha
   const shape = shapeOf(r, x, y, s, 256);
-  const base = document.createElement('canvas'); base.width = base.height = GEN;   // paper + faded neighbours, for the improvement pass
+  const base = document.createElement('canvas'); base.width = base.height = G;   // paper + faded neighbours, for the improvement pass
   base.getContext('2d').drawImage(src, 0, 0);
   const prof = profileOf(r), fillBase = prof.base || S.fillBase;
   if (S.engine === 'fill'){                                   // a solid shape to paint, not an empty outline
@@ -847,10 +861,10 @@ function snapshot(r){
     px.fillStyle = g; px.fillRect(0, 0, 256, 256);
     tx.globalCompositeOperation = 'source-in'; tx.drawImage(paint, 0, 0);
     sx.imageSmoothingEnabled = true; sx.imageSmoothingQuality = 'high';
-    sx.drawImage(t, 0, 0, GEN, GEN);
+    sx.drawImage(t, 0, 0, G, G);
   }
   const strokesOn = (ctx, alpha) => {
-    ctx.save(); ctx.globalAlpha = alpha; ctx.scale(GEN / s, GEN / s); ctx.translate(-x, -y);
+    ctx.save(); ctx.globalAlpha = alpha; ctx.scale(G / s, G / s); ctx.translate(-x, -y);
     for (const st of r.strokes) drawStroke(ctx, st, '#111');
     ctx.restore();
   };
@@ -874,21 +888,21 @@ function snapshot(r){
   mx.drawImage(f, 0, 0, ms, ms);
   mx.globalCompositeOperation = 'source-over';
   // edge map for ControlNet: only this sketch, white lines on black
-  const ctl = document.createElement('canvas'); ctl.width = ctl.height = GEN;
+  const ctl = document.createElement('canvas'); ctl.width = ctl.height = G;
   const cx2 = ctl.getContext('2d');
-  cx2.fillStyle = '#000'; cx2.fillRect(0, 0, GEN, GEN);
-  cx2.save(); cx2.scale(GEN / s, GEN / s); cx2.translate(-x, -y);
+  cx2.fillStyle = '#000'; cx2.fillRect(0, 0, G, G);
+  cx2.save(); cx2.scale(G / s, G / s); cx2.translate(-x, -y);
   for (const st of r.strokes) drawStroke(cx2, st, '#fff');
   cx2.restore();
   // improvement pass: the first result inside the shape, on the same paper, with the lines faintly on top
   const improve = bmp => {
-    const c = document.createElement('canvas'); c.width = c.height = GEN;
+    const c = document.createElement('canvas'); c.width = c.height = G;
     const cx = c.getContext('2d');
     cx.drawImage(base, 0, 0);
-    const t = document.createElement('canvas'); t.width = t.height = GEN;
+    const t = document.createElement('canvas'); t.width = t.height = G;
     const tx = t.getContext('2d');
-    tx.imageSmoothingEnabled = true; tx.drawImage(shape, 0, 0, GEN, GEN);
-    tx.globalCompositeOperation = 'source-in'; tx.drawImage(bmp, 0, 0, GEN, GEN);
+    tx.imageSmoothingEnabled = true; tx.drawImage(shape, 0, 0, G, G);
+    tx.globalCompositeOperation = 'source-in'; tx.drawImage(bmp, 0, 0, G, G);
     cx.drawImage(t, 0, 0);
     strokesOn(cx, 0.45);
     return c.toDataURL('image/jpeg', 0.9);
@@ -924,6 +938,9 @@ async function safeFetch(url, opts){
 }
 
 const isControl = model => /controlnet|canny/i.test(model);
+const isEdit = model => /kontext|nano-banana|\/edit\b|image-edit/i.test(model);
+const editInstruction = prompt => 'Turn the object in this image into a finished image: ' + prompt +
+  '. Keep its exact outline, shape, size and position. Remove all drawn lines and sketch marks. Keep the plain white background around it.';
 // pass = 'preview' | 'refine'; the engine picks the model and how the sketch is sent
 function job(pass){
   if (S.engine === 'controlnet') return { model: S.cnModel, steps: pass === 'preview' ? S.cnPreviewSteps : S.cnSteps };
@@ -931,13 +948,17 @@ function job(pass){
 }
 async function generate(model, steps, snap, prompt, seed, signal){
   if (!S.key) throw new Error('Add your fal.ai key in Settings.');
-  const control = isControl(model);
-  const input = control
+  const control = isControl(model), edit = isEdit(model);
+  const input = edit
+    ? { prompt: editInstruction(prompt), image_url: snap.url, seed, num_images: 1, sync_mode: true, output_format: 'jpeg',
+        enable_safety_checker: !!S.safety && !snap.noFilter }
+    : control
     ? { prompt, control_image_url: snap.control, controlnet_conditioning_scale: Number(S.cnScale), image_size: 'square_hd',
         negative_prompt: 'blurry, lowres, extra objects, scenery, busy background, frame, text, watermark',
         seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter }
     : { prompt, image_url: snap.url, strength: Number(snap.strength), seed, num_images: 1, sync_mode: true, enable_safety_checker: !!S.safety && !snap.noFilter };
-  if (String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
+  if (/nano-banana/.test(model)){ input.image_urls = [input.image_url]; delete input.image_url; }
+  if (!edit && String(steps).trim() !== '') input.num_inference_steps = /lightning/.test(model) ? String(steps).trim() : Number(steps);
   const res = await safeFetch('https://fal.run/' + model.trim(), {
     method: 'POST', signal,
     headers: { 'Authorization': 'Key ' + S.key.trim(), 'Content-Type': 'application/json' },
@@ -945,6 +966,10 @@ async function generate(model, steps, snap, prompt, seed, signal){
   });
   if (!res.ok){
     let t = ''; try { t = await res.text(); } catch {}
+    if (edit && [400, 404, 405, 422].includes(res.status)){                   // editing model not as expected: keep the old pass
+      if (!speech.editWarned){ speech.editWarned = true; toast('Final model request failed (' + res.status + ': ' + t.slice(0, 160) + '). Using the fast model for the final pass.'); }
+      return generate(S.refineModel, S.refineSteps, snap, prompt, seed, signal);
+    }
     if (control && [400, 404, 405, 422].includes(res.status)){                 // endpoint or its inputs not as expected:
       if (!speech.cnWarned){ speech.cnWarned = true; toast('ControlNet request failed (' + res.status + ': ' + t.slice(0, 160) + '). Using the fast model instead.'); }
       return generate(S.previewModel, S.previewSteps, snap, prompt, seed, signal);   // keep painting with the fast model
@@ -993,7 +1018,7 @@ function applyResult(r, bmp, snap, slot){
   cx.drawImage(bmp, 0, 0, c.width, c.height);
   cx.globalCompositeOperation = 'destination-in';
   cx.drawImage(snap.mask, 0, 0);
-  if (slot.res){ slot.res.canvas = c; }
+  if (slot.res) Object.assign(slot.res, { canvas: c, x: snap.x, y: snap.y, s: snap.s });
   else { slot.res = { regionId: r.id, canvas: c, x: snap.x, y: snap.y, s: snap.s, t: performance.now() }; results.push(slot.res); }
   composeGen(); redrawInk();
 }
@@ -1004,7 +1029,7 @@ async function runJob(r){
   const ac = new AbortController(); r.abort = ac;
   let snap = null, prompt = '';
   const seed = Math.floor(Math.random() * 2147483647);
-  const slot = {};
+  const slot = r.liveSlot || {};                                  // replace the live frame in place
   const t0 = performance.now();
   try {
     setStatus(r, 'preview');
@@ -1014,15 +1039,21 @@ async function runJob(r){
     if (r.version !== version || !regions.includes(r)) return;
     snap = snapshot(r);                                          // after describe: the fill uses the colour it found
     snap.noFilter = !!r.noFilter;
-    const pv = job('preview');
-    const a = await generateSafe(pv.model, pv.steps, snap, prompt, seed, ac.signal);
-    if (r.version !== version || !regions.includes(r)) return;     // sketch changed meanwhile: drop stale result
-    applyResult(r, a.bmp, snap, slot);
+    let a;
+    const lv = r.liveLast;
+    if (S.mode === 'live' && lv && lv.x === snap.x && lv.y === snap.y && lv.s === snap.s && lv.n === r.strokes.reduce((n, st) => n + st.pts.length, 0)){
+      a = { bmp: lv.bmp, seed: r.liveSeed };                       // the live frame already is the first pass
+    } else {
+      const pv = job('preview');
+      a = await generateSafe(pv.model, pv.steps, snap, prompt, seed, ac.signal);
+      if (r.version !== version || !regions.includes(r)) return;   // sketch changed meanwhile: drop stale result
+      applyResult(r, a.bmp, snap, slot);
+    }
     r.timing = Math.round(performance.now() - t0);
-    if (S.refine){
+    if (S.refine || S.mode === 'live'){
       setStatus(r, 'refining');
       let b = null;
-      const rf = job('refine');
+      const rf = S.engine === 'fill' && S.finalModel.trim() ? { model: S.finalModel.trim(), steps: '' } : job('refine');
       // fill engine: improve the first result (repaint it lightly) rather than start again from the sketch
       const input = S.engine === 'fill' ? Object.assign({}, snap, { url: snap.improve(a.bmp), strength: profileOf(r).refine }) : snap;
       try { b = await generate(rf.model, rf.steps, input, prompt, a.seed, ac.signal); }
@@ -1031,6 +1062,7 @@ async function runJob(r){
       if (b) applyResult(r, b, snap, slot);
     }
     r.timingTotal = Math.round(performance.now() - t0);
+    if (S.mode === 'live') melt(r);
     setStatus(r, 'done');
   } catch (err){
     if (err.name === 'AbortError') return;
@@ -1042,6 +1074,57 @@ async function runJob(r){
   } finally {
     if (r.abort === ac) r.abort = null;
   }
+}
+
+// ---------- live mode ----------
+// while you draw, the newest state of the sketch goes to the fast model as a small image; when a frame
+// comes back the next one is sent (newest state wins), with the sketch's own fixed seed so it changes smoothly
+const live = { busy: false, sent: '', lastAt: 0, warned: false };
+function liveTarget(){
+  const r = regions.filter(o => o.status === 'waiting').sort((a, b) => b.lastStroke - a.lastStroke)[0];
+  if (!r) return null;
+  let strokes = r.strokes;
+  if (current && current.pts.length > 1 && (current.t0 - r.lastStroke < S.joinWindow || intersects(r.bbox, strokeBox(current), NEAR_LINE)))
+    strokes = strokes.concat([current]);                         // the stroke you are drawing right now
+  return { r, strokes };
+}
+function liveSubject(r){
+  const typed = /[\p{L}\p{N}]/u.test(r.prompt) ? r.prompt.trim() : '';
+  const key = heardFor(r) + '|' + r.prompt + '|' + speech.brief;             // ask the LLM again only when the words changed
+  if (S.llm && !r.describing && key !== r.liveDescKey){
+    r.liveDescKey = key;
+    r.describing = describe(r, new AbortController().signal).catch(() => {}).finally(() => { r.describing = null; });
+  }
+  return typed || r.llmPrompt || heardFor(r);
+}
+async function liveTick(){
+  if (S.mode !== 'live' || live.busy || !S.key) return;
+  if (performance.now() - live.lastAt < 1000 / Math.max(0.5, Number(S.liveFps) || 3)) return;
+  const t = liveTarget(); if (!t) return;
+  const { r, strokes } = t;
+  const prompt = buildPrompt([liveSubject(r), profileOf(r).add].filter(Boolean).join(', '));
+  const sig = r.id + ':' + strokes.length + ':' + strokes.reduce((n, st) => n + st.pts.length, 0) + ':' + prompt;
+  if (sig === live.sent) return;
+  live.sent = sig; live.busy = true; live.lastAt = performance.now();
+  try {
+    if (!r.liveSeed) r.liveSeed = Math.floor(Math.random() * 2147483647);
+    const tmp = Object.assign({}, r, { strokes, bbox: strokes.map(strokeBox).reduce(unionBox) });
+    const snap = snapshot(tmp, 512);
+    snap.noFilter = !!r.noFilter;
+    const bmp = await generate(S.liveModel, S.liveSteps, snap, prompt, r.liveSeed, new AbortController().signal);
+    if (!regions.includes(r) || !['waiting', 'queued'].includes(r.status)) return;   // final pass already running
+    r.liveSlot = r.liveSlot || {};
+    r.liveLast = { bmp, x: snap.x, y: snap.y, s: snap.s, n: strokes.reduce((n, st) => n + st.pts.length, 0) };
+    applyResult(r, bmp, snap, r.liveSlot);
+  } catch (e){
+    if (e.name !== 'BlockedError' && !live.warned){ live.warned = true; toast('Live frame failed: ' + (e.message || e)); }
+  } finally { live.busy = false; }
+}
+setInterval(liveTick, 50);
+function melt(r){                                                 // lines fade out over the finished painting
+  r.meltStart = performance.now();
+  const step = () => { redrawInk(); if (performance.now() - r.meltStart < 1250) requestAnimationFrame(step); };
+  requestAnimationFrame(step);
 }
 
 // ---------- region sheet ----------
@@ -1084,6 +1167,13 @@ $('regionSheet').addEventListener('click', e => { if (e.target.id === 'regionShe
 // ---------- toolbar ----------
 $('style').value = S.style;
 $('style').addEventListener('change', () => { S.style = $('style').value; saveSettings(); });
+function updateMode(){
+  $('btnMode').textContent = S.mode === 'live' ? 'Live' : 'Sketch';
+  $('btnMode').setAttribute('aria-pressed', 'true');
+  document.getElementById('build').textContent = BUILD + ' \u00b7 ' + S.engine + ' \u00b7 ' + S.mode;
+}
+$('btnMode').onclick = () => { S.mode = S.mode === 'live' ? 'sketch' : 'live'; saveSettings(); updateMode(); redrawInk(); };
+updateMode();
 $('btnMic').onclick = () => speech.on ? stopListening() : startListening();
 $('btnGen').onclick = () => regions.filter(r => r.status === 'waiting' || r.status === 'error').forEach(enqueue);
 $('btnUndo').onclick = () => {
@@ -1115,7 +1205,7 @@ $('btnExport').onclick = () => {
 };
 
 // ---------- settings sheet ----------
-const FIELDS = [['sKey','key'],['sEngine','engine'],['sFillStr','fillStrength',Number],['sFillTone','fillTone'],['sFillBase','fillBase'],['sCnM','cnModel'],['sCnScale','cnScale',Number],['sCnPS','cnPreviewSteps',Number],['sCnS','cnSteps',Number],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
+const FIELDS = [['sKey','key'],['sLiveM','liveModel'],['sLiveFps','liveFps',Number],['sLiveS','liveSteps'],['sFinal','finalModel'],['sEngine','engine'],['sFillStr','fillStrength',Number],['sFillTone','fillTone'],['sFillBase','fillBase'],['sCnM','cnModel'],['sCnScale','cnScale',Number],['sCnPS','cnPreviewSteps',Number],['sCnS','cnSteps',Number],['sExtra','extra'],['sLang','lang'],['sLlmEp','llmEndpoint'],['sLlmModel','llmModel'],['sPM','previewModel'],['sPS','previewSteps'],['sRM','refineModel'],['sRS','refineSteps'],
   ['sStr','strength',Number],['sPar','parallel',Number],['sDwell','dwell',Number],['sJoin','joinWindow',Number],['sLeave','leave',Number],['sCtx','context',Number],['sNb','neighbours',Number],['sBrush','brush',Number]];
 function openSettings(){
   for (const [id, k] of FIELDS) $(id).value = S[k];
